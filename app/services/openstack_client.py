@@ -5,7 +5,7 @@ from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from typing import Any, NoReturn, Protocol, TypeVar
 
-from app.config import Settings
+from app.config import DEFAULT_OPENSTACK_AUTH_TYPE, ConfigurationError, Settings
 from app.errors.handlers import (
     ApiError,
     GatewayTimeout,
@@ -120,29 +120,58 @@ class OpenStackClient:
 
     def _connect(self) -> Any:
         try:
-            self._settings.validate_openstack()
-        except ValueError as error:
+            kwargs: dict[str, Any] = {
+                **self._build_auth_config(),
+                "identity_api_version": self._settings.os_identity_api_version,
+                "app_name": "openstack-middleware-api",
+                "app_version": "0.1.0",
+                "connect_retries": 2,
+                "timeout": 30,
+            }
+        except ConfigurationError as error:
             self._logger.error(
                 "openstack_configuration_invalid",
                 extra={"error_type": type(error).__name__},
             )
             raise UpstreamUnavailable("OpenStack service is not configured.") from error
 
-        kwargs: dict[str, Any] = {
-            "auth_type": "v3applicationcredential",
-            "auth": self._settings.openstack_auth,
-            "identity_api_version": self._settings.os_identity_api_version,
-            "app_name": "openstack-middleware-api",
-            "app_version": "0.1.0",
-            "connect_retries": 2,
-            "timeout": 30,
-        }
         if self._settings.os_region_name:
             kwargs["region_name"] = self._settings.os_region_name
         if self._settings.os_interface:
             kwargs["interface"] = self._settings.os_interface
 
         return self._execute("connect", lambda: openstack_connect(**kwargs))
+
+    def _build_auth_config(self) -> dict[str, Any]:
+        """Build OpenStack SDK auth kwargs for the selected auth mode."""
+        self._settings.validate_openstack()
+        auth_type = self._settings.resolved_openstack_auth_type
+
+        if auth_type == DEFAULT_OPENSTACK_AUTH_TYPE:
+            return {
+                "auth_type": "v3applicationcredential",
+                "auth": {
+                    "auth_url": self._settings.os_auth_url or "",
+                    "application_credential_id": (
+                        self._settings.os_application_credential_id or ""
+                    ),
+                    "application_credential_secret": (
+                        self._settings.os_application_credential_secret or ""
+                    ),
+                },
+            }
+
+        return {
+            "auth_type": "v3password",
+            "auth": {
+                "auth_url": self._settings.os_auth_url or "",
+                "username": self._settings.os_username or "",
+                "password": self._settings.os_password or "",
+                "user_domain_name": self._settings.os_user_domain_name or "",
+                "project_name": self._settings.os_project_name or "",
+                "project_domain_name": (self._settings.os_project_domain_name or ""),
+            },
+        }
 
     def _execute(self, operation: str, func: Callable[[], T]) -> T:
         try:

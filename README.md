@@ -1,9 +1,10 @@
 # openstack-middleware-api
 
 A production-ready Flask middleware API for exposing selected OpenStack
-infrastructure data through public, normalized REST endpoints. The API uses an
-OpenStack Application Credential owned by the service account. It never accepts
-or forwards end-user OpenStack credentials.
+infrastructure data through public, normalized REST endpoints. The API supports
+OpenStack Application Credential auth for service deployments and
+username/password auth for environments where application credentials are not
+available.
 
 ## Architecture
 
@@ -95,17 +96,62 @@ API_KEY=
 Required for OpenStack queries:
 
 ```text
+OS_AUTH_TYPE=
 OS_AUTH_URL=
-OS_APPLICATION_CREDENTIAL_ID=
-OS_APPLICATION_CREDENTIAL_SECRET=
-OS_PROJECT_ID=
 OS_REGION_NAME=
 OS_INTERFACE=
 OS_IDENTITY_API_VERSION=
 ```
 
 `OS_IDENTITY_API_VERSION` should normally be `3`, and `OS_INTERFACE` should
-usually be `public`.
+usually be `public`. `OS_AUTH_TYPE` defaults to `application_credential` when
+unset for backward compatibility.
+
+## OpenStack Auth Modes
+
+The service supports two OpenStack auth modes:
+
+- `application_credential`: recommended for service and middleware deployments.
+  Application Credentials are usually already scoped to a project, so the app
+  does not send `project_id`, `project_name`, or domain values in this mode.
+- `password`: useful for local testing or environments where Application
+  Credentials are not available.
+
+### Application Credential Example
+
+```dotenv
+OS_AUTH_TYPE=application_credential
+
+OS_AUTH_URL=https://openstack.example:5000/v3
+OS_REGION_NAME=RegionOne
+OS_INTERFACE=public
+OS_IDENTITY_API_VERSION=3
+
+OS_APPLICATION_CREDENTIAL_ID=your-application-credential-id
+OS_APPLICATION_CREDENTIAL_SECRET=your-application-credential-secret
+```
+
+### Username/Password Example
+
+```dotenv
+OS_AUTH_TYPE=password
+
+OS_AUTH_URL=https://openstack.example:5000/v3
+OS_REGION_NAME=RegionOne
+OS_INTERFACE=public
+OS_IDENTITY_API_VERSION=3
+
+OS_USERNAME=demo-user
+OS_PASSWORD=your-password
+OS_USER_DOMAIN_NAME=Default
+OS_PROJECT_NAME=demo-project
+OS_PROJECT_DOMAIN_NAME=Default
+```
+
+If Application Credential auth fails with `401 Unauthorized`, remove
+`OS_PROJECT_ID` from the environment. Application Credentials are usually
+project-scoped already, and sending an extra project scope can cause Keystone
+authentication failures.
 
 ## Running Locally
 
@@ -226,8 +272,8 @@ The pre-commit configuration runs Ruff, Ruff format, and mypy.
 
 ## Security Considerations
 
-- The service authenticates to OpenStack only with Application Credentials.
-- End-user OpenStack credentials are never accepted.
+- Application Credential auth is recommended for production service use.
+- Username/password auth is available for local testing or legacy environments.
 - API keys, OpenStack secrets, tokens, and raw SDK exceptions are not returned
   to clients.
 - Authentication failures are logged with reason codes, paths, and methods, but
