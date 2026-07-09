@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openstack-middleware-api"
+version = "0.1.0"
+description = "Public Flask middleware API for selected OpenStack infrastructure data."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "OpenStack Middleware API Maintainers" }]
+dependencies = [
+  "Flask>=3.0.0,<4.0.0",
+  "gunicorn>=22.0.0,<24.0.0",
+  "openstacksdk>=4.0.0,<5.0.0",
+  "python-dotenv>=1.0.0,<2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "black>=24.0.0",
+  "mypy>=1.10.0",
+  "pre-commit>=3.7.0",
+  "pytest>=8.0.0",
+  "pytest-cov>=5.0.0",
+  "ruff>=0.8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["B", "C4", "E", "F", "I", "RUF", "SIM", "UP", "W"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+ignore_missing_imports = true
+exclude = ["\\.venv"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
