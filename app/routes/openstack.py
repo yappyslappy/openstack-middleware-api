@@ -23,9 +23,9 @@ def list_projects() -> ResponseReturnValue:
 
 @bp.get("/servers")
 def list_servers() -> ResponseReturnValue:
-    """Return OpenStack servers, optionally filtered by a tag."""
-    tag = _validate_tag(request.args.get("tag"))
-    return success_response(_openstack_service().list_servers(tag=tag))
+    """Return OpenStack servers, optionally filtered by tags."""
+    tags = _validate_tags(request.args.getlist("tag"))
+    return success_response(_openstack_service().list_servers(tags=tags))
 
 
 @bp.get("/servers/<server_id>")
@@ -61,10 +61,21 @@ def _openstack_service() -> OpenStackService:
     return cast(OpenStackService, service)
 
 
-def _validate_tag(tag: str | None) -> str | None:
-    if tag is None:
-        return None
+def _validate_tags(raw_tags: list[str]) -> list[str]:
+    tags: list[str] = []
+    seen: set[str] = set()
 
+    for raw_tag in raw_tags:
+        tag = _validate_tag(raw_tag)
+        if tag in seen:
+            continue
+        seen.add(tag)
+        tags.append(tag)
+
+    return tags
+
+
+def _validate_tag(tag: str) -> str:
     normalized = tag.strip()
     if not normalized:
         raise BadRequest("Server tag must be non-empty.")

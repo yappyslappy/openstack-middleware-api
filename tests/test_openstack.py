@@ -103,8 +103,8 @@ class FakeRouteService:
     def list_projects(self) -> list[dict[str, str]]:
         return [{"id": "project-1", "name": "demo"}]
 
-    def list_servers(self, tag: str | None = None) -> list[dict[str, Any]]:
-        return [{"id": "server-1", "name": "web01", "tag": tag}]
+    def list_servers(self, tags: list[str] | None = None) -> list[dict[str, Any]]:
+        return [{"id": "server-1", "name": "web01", "tags": tags or []}]
 
     def get_server(self, server_id: str) -> dict[str, str]:
         if server_id != "server-1":

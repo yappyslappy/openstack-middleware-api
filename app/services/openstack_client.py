@@ -23,8 +23,8 @@ class OpenStackService(Protocol):
     def list_projects(self) -> list[dict[str, Any]]:
         """Return visible OpenStack projects."""
 
-    def list_servers(self, tag: str | None = None) -> list[dict[str, Any]]:
-        """Return visible OpenStack servers, optionally filtered by tag."""
+    def list_servers(self, tags: list[str] | None = None) -> list[dict[str, Any]]:
+        """Return visible OpenStack servers, optionally filtered by tags."""
 
     def get_server(self, server_id: str) -> dict[str, Any]:
         """Return one OpenStack server by ID."""
@@ -66,25 +66,35 @@ class OpenStackClient:
         )
         return [_normalize_project(project) for project in projects]
 
-    def list_servers(self, tag: str | None = None) -> list[dict[str, Any]]:
+    def list_servers(self, tags: list[str] | None = None) -> list[dict[str, Any]]:
         """Return servers visible to the service account."""
+        requested_tags = _dedupe_preserving_order(tags or [])
         query: dict[str, Any] = {"details": True}
-        if tag:
-            query["tags"] = tag
+        if requested_tags:
+            query["tags"] = _server_tags_query(requested_tags)
 
         try:
             servers = list(self.connection.compute.servers(**query))
         except Exception as error:
-            if tag and _is_native_tag_filter_unsupported(error):
+            if requested_tags and _is_native_tag_filter_unsupported(error):
                 servers = self._execute(
                     "list_servers_fallback",
                     lambda: list(self.connection.compute.servers(details=True)),
                 )
                 servers = [
-                    server for server in servers if _resource_has_tag(server, tag)
+                    server
+                    for server in servers
+                    if _resource_has_tags(server, requested_tags)
                 ]
             else:
                 self._raise_openstack_error("list_servers", error)
+        else:
+            if requested_tags:
+                servers = [
+                    server
+                    for server in servers
+                    if _resource_has_tags(server, requested_tags)
+                ]
 
         return [_normalize_server(server) for server in servers]
 
@@ -307,8 +317,24 @@ def _normalize_flavor(flavor: Any) -> dict[str, Any]:
     }
 
 
-def _resource_has_tag(resource: Any, tag: str) -> bool:
-    return tag in _string_list(_value(resource, "tags"), default=[])
+def _dedupe_preserving_order(values: Iterable[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _server_tags_query(tags: list[str]) -> str:
+    return ",".join(tags)
+
+
+def _resource_has_tags(resource: Any, tags: list[str]) -> bool:
+    resource_tags = set(_string_list(_value(resource, "tags"), default=[]))
+    return all(tag in resource_tags for tag in tags)
 
 
 def _value(resource: Any, *names: str, default: Any = None) -> Any:
