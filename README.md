@@ -200,6 +200,7 @@ GET /health
 GET /api/v1/projects
 GET /api/v1/servers
 GET /api/v1/servers?tag=production
+GET /api/v1/servers?tag=production&tag=web
 GET /api/v1/servers/<server_id>
 GET /api/v1/networks
 GET /api/v1/images
@@ -213,6 +214,7 @@ curl http://localhost:5000/health
 curl http://localhost:5000/api/v1/projects
 curl http://localhost:5000/api/v1/servers
 curl "http://localhost:5000/api/v1/servers?tag=production"
+curl "http://localhost:5000/api/v1/servers?tag=production&tag=web"
 curl http://localhost:5000/api/v1/servers/server-id
 curl http://localhost:5000/api/v1/networks
 curl http://localhost:5000/api/v1/images
@@ -244,11 +246,23 @@ with JWT validation, OAuth2, multiple API keys, RBAC, or rate limiting.
 
 ## Server Tag Filtering
 
-`GET /api/v1/servers?tag=<tag>` supports OpenStack server tag filtering. The API
-validates that tags are non-empty, at most 128 characters, and free of control
-characters. The service first attempts native OpenStack SDK tag filtering. If
-that is unavailable in the target cloud, it safely fetches visible servers and
-filters by tag in the service layer.
+`GET /api/v1/servers?tag=<tag>` supports OpenStack server tag filtering.
+Multiple `tag` parameters are supported:
+
+```text
+GET /api/v1/servers?tag=production
+GET /api/v1/servers?tag=production&tag=web
+```
+
+Multiple tags use AND matching, so a server must contain every requested tag to
+be returned. The order of tag parameters does not affect matching. Duplicate
+tags are ignored while preserving the first occurrence.
+
+The API validates that tags are non-empty after trimming whitespace, at most 128
+characters, and free of control characters. Invalid or empty tags return HTTP
+400. The service first attempts native OpenStack SDK tag filtering with Nova's
+comma-separated tag query syntax. If that is unavailable in the target cloud, it
+safely fetches visible servers and filters by tag in the service layer.
 
 ## Running Tests
 
