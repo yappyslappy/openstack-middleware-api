@@ -7,6 +7,11 @@ from flask.typing import ResponseReturnValue
 
 from app.config import Settings
 from app.errors.handlers import BadRequest
+from app.services.inventory_query import (
+    InventoryQueryService,
+    InventoryResponse,
+    create_inventory_query_service,
+)
 from app.services.openstack_client import OpenStackClient, OpenStackService
 from app.utils import success_response
 
@@ -17,39 +22,53 @@ bp = Blueprint("openstack", __name__, url_prefix="/api/v1")
 
 @bp.get("/projects")
 def list_projects() -> ResponseReturnValue:
-    """Return OpenStack projects visible to the service account."""
-    return success_response(_openstack_service().list_projects())
+    """Return inventory projects for the configured scope."""
+    return _inventory_success(_inventory_query_service().list_projects(request.args))
 
 
 @bp.get("/servers")
 def list_servers() -> ResponseReturnValue:
-    """Return OpenStack servers, optionally filtered by tags."""
+    """Return inventory servers, optionally filtered by tags."""
     tags = _validate_tags(request.args.getlist("tag"))
-    return success_response(_openstack_service().list_servers(tags=tags))
+    return _inventory_success(
+        _inventory_query_service().list_servers(request.args, tags)
+    )
 
 
 @bp.get("/servers/<server_id>")
 def get_server(server_id: str) -> ResponseReturnValue:
-    """Return one OpenStack server by ID."""
-    return success_response(_openstack_service().get_server(server_id))
+    """Return one inventory server by ID."""
+    return _inventory_success(_inventory_query_service().get_server(server_id))
 
 
 @bp.get("/networks")
 def list_networks() -> ResponseReturnValue:
-    """Return OpenStack networks visible to the service account."""
-    return success_response(_openstack_service().list_networks())
+    """Return inventory networks for the configured scope."""
+    return _inventory_success(_inventory_query_service().list_networks(request.args))
 
 
 @bp.get("/images")
 def list_images() -> ResponseReturnValue:
-    """Return OpenStack images visible to the service account."""
-    return success_response(_openstack_service().list_images())
+    """Return inventory images for the configured scope."""
+    return _inventory_success(_inventory_query_service().list_images(request.args))
 
 
 @bp.get("/flavors")
 def list_flavors() -> ResponseReturnValue:
-    """Return OpenStack flavors visible to the service account."""
-    return success_response(_openstack_service().list_flavors())
+    """Return inventory flavors for the configured scope."""
+    return _inventory_success(_inventory_query_service().list_flavors(request.args))
+
+
+def _inventory_success(response: InventoryResponse) -> ResponseReturnValue:
+    return success_response(response.data, meta=response.meta)
+
+
+def _inventory_query_service() -> InventoryQueryService:
+    service = current_app.extensions.get("inventory_query_service")
+    if service is None:
+        service = create_inventory_query_service(current_app)
+        current_app.extensions["inventory_query_service"] = service
+    return cast(InventoryQueryService, service)
 
 
 def _openstack_service() -> OpenStackService:

@@ -14,6 +14,7 @@ def create_app(settings: Settings | None = None) -> Flask:
     """Create and configure the Flask application."""
     app = Flask(__name__, instance_relative_config=True)
     app_settings = settings or Settings.from_env()
+    app_settings.validate_inventory()
 
     app.config.update(
         ENV=app_settings.flask_env,

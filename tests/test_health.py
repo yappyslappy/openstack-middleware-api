@@ -1,20 +1,17 @@
 from __future__ import annotations
 
-from app import create_app
-from app.config import Settings
+from flask import Flask
 
 
-def test_health_endpoint_is_public() -> None:
-    app = create_app(Settings(api_key="test-key", testing=True))
+def test_health_endpoint_is_public(inventory_app: Flask) -> None:
+    app = inventory_app
     client = app.test_client()
 
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.get_json() == {
-        "status": "success",
-        "data": {
-            "service": "openstack-middleware-api",
-            "status": "ok",
-        },
-    }
+    data = response.get_json()["data"]
+    assert data["application"] == "healthy"
+    assert data["database"] == "healthy"
+    assert data["inventory_scope"] == "appdev"
+    assert data["inventory_stale"] is False

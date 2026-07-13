@@ -99,26 +99,31 @@ class FakeConnection:
         self.image = FakeImage()
 
 
-class FakeRouteService:
-    def list_projects(self) -> list[dict[str, str]]:
-        return [{"id": "project-1", "name": "demo"}]
+class FakeInventoryRouteService:
+    def list_projects(self, args: Any) -> SimpleNamespace:
+        return SimpleNamespace(data=[{"id": "project-1", "name": "demo"}], meta=None)
 
-    def list_servers(self, tags: list[str] | None = None) -> list[dict[str, Any]]:
-        return [{"id": "server-1", "name": "web01", "tags": tags or []}]
+    def list_servers(self, args: Any, tags: list[str] | None = None) -> SimpleNamespace:
+        return SimpleNamespace(
+            data=[{"id": "server-1", "name": "web01", "tags": tags or []}],
+            meta=None,
+        )
 
-    def get_server(self, server_id: str) -> dict[str, str]:
+    def get_server(self, server_id: str) -> SimpleNamespace:
         if server_id != "server-1":
-            raise NotFound("OpenStack server was not found.")
-        return {"id": "server-1", "name": "web01"}
+            raise NotFound("Inventory server was not found.")
+        return SimpleNamespace(data={"id": "server-1", "name": "web01"}, meta=None)
 
-    def list_networks(self) -> list[dict[str, str]]:
-        return [{"id": "network-1", "name": "private"}]
+    def list_networks(self, args: Any) -> SimpleNamespace:
+        return SimpleNamespace(data=[{"id": "network-1", "name": "private"}], meta=None)
 
-    def list_images(self) -> list[dict[str, str]]:
-        return [{"id": "image-1", "name": "Ubuntu 24.04"}]
+    def list_images(self, args: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            data=[{"id": "image-1", "name": "Ubuntu 24.04"}], meta=None
+        )
 
-    def list_flavors(self) -> list[dict[str, str]]:
-        return [{"id": "flavor-1", "name": "m1.small"}]
+    def list_flavors(self, args: Any) -> SimpleNamespace:
+        return SimpleNamespace(data=[{"id": "flavor-1", "name": "m1.small"}], meta=None)
 
 
 def test_openstack_service_normalizes_resources() -> None:
@@ -155,8 +160,8 @@ def test_get_server_not_found_is_standardized() -> None:
 
 
 def test_api_routes_use_standard_success_envelope() -> None:
-    app = create_app(Settings(api_key="test-key", testing=True))
-    app.extensions["openstack_service"] = FakeRouteService()
+    app = create_app(_inventory_settings())
+    app.extensions["inventory_query_service"] = FakeInventoryRouteService()
     client = app.test_client()
 
     assert client.get("/api/v1/projects").get_json() == {
@@ -173,8 +178,8 @@ def test_api_routes_use_standard_success_envelope() -> None:
 
 
 def test_api_route_errors_use_standard_error_envelope() -> None:
-    app = create_app(Settings(api_key="test-key", testing=True))
-    app.extensions["openstack_service"] = FakeRouteService()
+    app = create_app(_inventory_settings())
+    app.extensions["inventory_query_service"] = FakeInventoryRouteService()
     client = app.test_client()
 
     response = client.get("/api/v1/servers/missing")
@@ -182,6 +187,18 @@ def test_api_route_errors_use_standard_error_envelope() -> None:
     assert response.status_code == 404
     assert response.get_json() == {
         "status": "error",
-        "message": "OpenStack server was not found.",
+        "message": "Inventory server was not found.",
         "code": 404,
     }
+
+
+def _inventory_settings() -> Settings:
+    return Settings(
+        api_key="test-key",
+        testing=True,
+        inventory_scope="appdev",
+        mysql_host="127.0.0.1",
+        mysql_database="openstack_inventory",
+        mysql_username="openstack_api",
+        mysql_password="secret-password",
+    )
