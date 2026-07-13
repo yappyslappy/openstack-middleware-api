@@ -14,24 +14,27 @@ class RecordingRouteService:
     def __init__(self) -> None:
         self.last_tags: list[str] | None = None
 
-    def list_projects(self) -> list[dict[str, Any]]:
-        return []
+    def list_projects(self, args: Any) -> SimpleNamespace:
+        return SimpleNamespace(data=[], meta=None)
 
-    def list_servers(self, tags: list[str] | None = None) -> list[dict[str, Any]]:
+    def list_servers(self, args: Any, tags: list[str] | None = None) -> SimpleNamespace:
         self.last_tags = list(tags or [])
-        return [{"id": "server-1", "tags": self.last_tags}]
+        return SimpleNamespace(
+            data=[{"id": "server-1", "tags": self.last_tags}],
+            meta=None,
+        )
 
-    def get_server(self, server_id: str) -> dict[str, Any]:
-        return {"id": server_id}
+    def get_server(self, server_id: str) -> SimpleNamespace:
+        return SimpleNamespace(data={"id": server_id}, meta=None)
 
-    def list_networks(self) -> list[dict[str, Any]]:
-        return []
+    def list_networks(self, args: Any) -> SimpleNamespace:
+        return SimpleNamespace(data=[], meta=None)
 
-    def list_images(self) -> list[dict[str, Any]]:
-        return []
+    def list_images(self, args: Any) -> SimpleNamespace:
+        return SimpleNamespace(data=[], meta=None)
 
-    def list_flavors(self) -> list[dict[str, Any]]:
-        return []
+    def list_flavors(self, args: Any) -> SimpleNamespace:
+        return SimpleNamespace(data=[], meta=None)
 
 
 class NativeTagCompute:
@@ -78,13 +81,25 @@ def _server(server_id: str, tags: Any) -> SimpleNamespace:
 
 
 def _client_with_service(service: Any) -> FlaskClient:
-    app = create_app(Settings(api_key="test-key", testing=True))
-    app.extensions["openstack_service"] = service
+    app = create_app(_inventory_settings())
+    app.extensions["inventory_query_service"] = service
     return app.test_client()
 
 
 def _openstack_service(compute: Any) -> OpenStackClient:
     return OpenStackClient(Settings(testing=True), connection=FakeConnection(compute))
+
+
+def _inventory_settings() -> Settings:
+    return Settings(
+        api_key="test-key",
+        testing=True,
+        inventory_scope="appdev",
+        mysql_host="127.0.0.1",
+        mysql_database="openstack_inventory",
+        mysql_username="openstack_api",
+        mysql_password="secret-password",
+    )
 
 
 def test_no_tag_query_is_public_and_passes_empty_tags_to_service() -> None:

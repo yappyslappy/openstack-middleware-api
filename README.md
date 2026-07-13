@@ -1,20 +1,25 @@
 # openstack-middleware-api
 
 A production-ready Flask middleware API for exposing selected OpenStack
-infrastructure data through public, normalized REST endpoints. The API supports
-OpenStack Application Credential auth for service deployments and
-username/password auth for environments where application credentials are not
-available.
+infrastructure data through public, normalized REST endpoints. Public read
+endpoints query the MySQL inventory database populated by the separate
+`openstack-inventory-sync` project. The OpenStack SDK client is retained for
+future authenticated mutating endpoints.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
+    OpenStackProjects[OpenStack projects] --> Sync[openstack-inventory-sync]
+    Sync --> MySQL[(MySQL inventory)]
     Client[Public API client] --> Flask[Flask app factory]
     Flask --> Auth[Method-based auth middleware]
-    Flask --> Routes[Blueprint routes]
-    Routes --> Service[OpenStack service wrapper]
-    Service --> SDK[openstacksdk]
+    Flask --> Routes[GET Blueprint routes]
+    Routes --> InventoryService[Inventory query service]
+    InventoryService --> Repository[SQLAlchemy repository]
+    Repository --> MySQL
+    Protected[Protected future write endpoint] --> OpenStackService[OpenStack client]
+    OpenStackService --> SDK[openstacksdk]
     SDK --> OpenStack[OpenStack APIs]
     Flask --> Errors[Error handlers]
     Flask --> Logs[Structured logging]
@@ -22,15 +27,21 @@ flowchart LR
 
 - `app/__init__.py` creates the Flask app and wires configuration, middleware,
   Blueprints, logging, and error handlers.
-- `app/routes/` contains thin route handlers for health checks and OpenStack
+- `app/routes/` contains thin route handlers for health checks and inventory
   resources.
-- `app/services/openstack_client.py` owns all `openstacksdk` interaction and
-  normalizes SDK resource objects into safe JSON payloads.
+- `app/database/` owns SQLAlchemy engine/session setup and read-only table
+  descriptions for the sync-owned inventory schema.
+- `app/repositories/inventory.py` owns source-scoped SQL queries, pagination,
+  filtering, and tag/address loading.
+- `app/services/inventory_query.py` validates request filters and normalizes
+  database rows into safe public JSON payloads.
+- `app/services/openstack_client.py` keeps lazy `openstacksdk` support for
+  future authenticated write operations.
 - `app/middleware/auth.py` applies reusable method-based bearer API key checks.
 - `app/errors/handlers.py` returns consistent, client-safe error responses.
 - `app/utils/logging.py` emits structured request logs without secrets.
-- `tests/` mocks OpenStack behavior and verifies route, middleware, and service
-  behavior.
+- `tests/` uses SQLite-backed inventory fixtures for GET routes and keeps
+  OpenStack client tests for future write behavior.
 
 ## Directory Structure
 
@@ -39,12 +50,21 @@ openstack-middleware-api/
 ├── app/
 │   ├── __init__.py
 │   ├── config.py
+│   ├── database/
+│   │   ├── __init__.py
+│   │   ├── engine.py
+│   │   ├── models.py
+│   │   └── session.py
+│   ├── repositories/
+│   │   ├── __init__.py
+│   │   └── inventory.py
 │   ├── routes/
 │   │   ├── __init__.py
 │   │   ├── health.py
 │   │   └── openstack.py
 │   ├── services/
 │   │   ├── __init__.py
+│   │   ├── inventory_query.py
 │   │   └── openstack_client.py
 │   ├── middleware/
 │   │   ├── __init__.py
@@ -57,6 +77,7 @@ openstack-middleware-api/
 │       └── logging.py
 ├── tests/
 │   ├── test_health.py
+│   ├── test_inventory_api.py
 │   ├── test_auth.py
 │   ├── test_openstack.py
 │   └── test_server_tags.py
@@ -64,6 +85,7 @@ openstack-middleware-api/
 ├── .env.example
 ├── .gitignore
 ├── .pre-commit-config.yaml
+├── AGENTS.md
 ├── LICENSE
 ├── pyproject.toml
 ├── README.md
@@ -87,13 +109,32 @@ Copy the example file and fill in values for your environment:
 cp .env.example .env
 ```
 
-Required for protected write methods:
+Required inventory and API settings:
 
 ```text
 API_KEY=
+INVENTORY_SCOPE=appdev
+INVENTORY_MAX_AGE_SECONDS=900
+MYSQL_HOST=127.0.0.1
+MYSQL_PORT=3306
+MYSQL_DATABASE=openstack_inventory
+MYSQL_USERNAME=openstack_api
+MYSQL_PASSWORD=
+MYSQL_CHARSET=utf8mb4
+MYSQL_POOL_SIZE=5
+MYSQL_MAX_OVERFLOW=10
+MYSQL_POOL_RECYCLE=1800
 ```
 
-Required for OpenStack queries:
+`INVENTORY_SCOPE` is deployment-level isolation. An AppDev deployment should use
+`INVENTORY_SCOPE=appdev`; an AppTest deployment should use
+`INVENTORY_SCOPE=apptest`. API clients cannot select a scope with a request
+parameter.
+
+GET endpoints do not require working OpenStack credentials at application
+startup and do not query OpenStack. OpenStack configuration is retained for
+future authenticated write endpoints and is validated lazily when the OpenStack
+client is used.
 
 ```text
 OS_AUTH_TYPE=
@@ -153,6 +194,31 @@ If Application Credential auth fails with `401 Unauthorized`, remove
 project-scoped already, and sending an extra project scope can cause Keystone
 authentication failures.
 
+## Inventory Database
+
+The inventory schema is owned and migrated by `openstack-inventory-sync`. This
+API defines read-only SQLAlchemy table descriptions for SELECT queries only. Do
+not run Alembic migrations for inventory tables from this project, and do not
+call `Base.metadata.create_all()` or any schema-creation behavior in the API.
+
+Every resource query resolves the configured active source with
+`inventory_sources.scope_key = INVENTORY_SCOPE` and includes
+`resource.inventory_source_id = inventory_sources.id`. Active resource rows are
+filtered with `is_deleted = false`.
+
+Use a dedicated read-only MySQL identity for the API:
+
+```sql
+CREATE USER 'openstack_api'@'<API_SERVER_IP>'
+  IDENTIFIED BY '<STRONG_PASSWORD>';
+
+GRANT SELECT
+ON openstack_inventory.*
+TO 'openstack_api'@'<API_SERVER_IP>';
+
+FLUSH PRIVILEGES;
+```
+
 ## Running Locally
 
 ```bash
@@ -207,14 +273,32 @@ GET /api/v1/images
 GET /api/v1/flavors
 ```
 
+`GET /health` returns application and database health, the configured inventory
+scope, the last successful sync timestamp, inventory age in seconds, and an
+`inventory_stale` flag. Unreachable MySQL or an unknown/inactive
+`INVENTORY_SCOPE` returns HTTP 503 with a sanitized error response. Stale
+inventory returns HTTP 200 with `inventory_stale=true` so short sync delays do
+not unnecessarily remove the API from load balancers.
+
+Collection endpoints support pagination:
+
+```text
+?page=1&per_page=100
+```
+
+`page` defaults to `1`, `per_page` defaults to `100`, and `per_page` is capped
+at `500`. To preserve existing clients, the default response remains
+`status` plus `data`; when `page` or `per_page` is supplied, responses also
+include `meta` with pagination and inventory freshness fields.
+
 ## Example Curl Commands
 
 ```bash
 curl http://localhost:5000/health
 curl http://localhost:5000/api/v1/projects
 curl http://localhost:5000/api/v1/servers
-curl "http://localhost:5000/api/v1/servers?tag=production"
-curl "http://localhost:5000/api/v1/servers?tag=production&tag=web"
+curl http://localhost:5000/api/v1/servers?tag=production
+curl http://localhost:5000/api/v1/servers?tag=production&tag=web
 curl http://localhost:5000/api/v1/servers/server-id
 curl http://localhost:5000/api/v1/networks
 curl http://localhost:5000/api/v1/images
@@ -246,7 +330,7 @@ with JWT validation, OAuth2, multiple API keys, RBAC, or rate limiting.
 
 ## Server Tag Filtering
 
-`GET /api/v1/servers?tag=<tag>` supports OpenStack server tag filtering.
+`GET /api/v1/servers?tag=<tag>` supports MySQL-backed server tag filtering.
 Multiple `tag` parameters are supported:
 
 ```text
@@ -260,9 +344,9 @@ tags are ignored while preserving the first occurrence.
 
 The API validates that tags are non-empty after trimming whitespace, at most 128
 characters, and free of control characters. Invalid or empty tags return HTTP
-400. The service first attempts native OpenStack SDK tag filtering with Nova's
-comma-separated tag query syntax. If that is unavailable in the target cloud, it
-safely fetches visible servers and filters by tag in the service layer.
+400. Matching is performed in SQL with a grouped `server_tags` query and
+`HAVING COUNT(DISTINCT tag) = requested_tag_count`; the API does not load every
+server and filter tags in Python.
 
 ## Running Tests
 
@@ -284,15 +368,38 @@ pre-commit run --all-files
 
 The pre-commit configuration runs Ruff, Ruff format, and mypy.
 
+Optional MySQL integration testing should use a disposable database populated by
+`openstack-inventory-sync` migrations. The default test suite uses SQLite and
+does not require a real MySQL server.
+
+## Production Upgrade
+
+1. Deploy and verify `openstack-inventory-sync` first so MySQL has current
+   `inventory_sources` and resource rows for the target scope.
+2. Create a dedicated API MySQL user with `SELECT` only.
+3. Configure `INVENTORY_SCOPE` and MySQL environment variables for each API
+   deployment, such as `appdev` or `apptest`.
+4. Deploy this API version and check `/health` for `database=healthy` and the
+   expected inventory scope.
+5. Confirm GET endpoints return inventory data without OpenStack API traffic.
+
+Rollback is the previous API version plus its previous environment. Keep the
+sync service running during rollback unless the prior API version explicitly
+does not need inventory freshness. If MySQL is unavailable, this version returns
+503 for GET endpoints instead of falling back to OpenStack.
+
 ## Security Considerations
 
-- Application Credential auth is recommended for production service use.
+- Use a dedicated read-only MySQL account with `SELECT` privileges only.
+- Application Credential auth is recommended for future protected OpenStack
+  write operations.
 - Username/password auth is available for local testing or legacy environments.
 - API keys, OpenStack secrets, tokens, and raw SDK exceptions are not returned
   to clients.
 - Authentication failures are logged with reason codes, paths, and methods, but
   never with bearer tokens.
-- OpenStack exceptions are translated into standardized client-safe responses.
+- Database and OpenStack exceptions are translated into standardized client-safe
+  responses.
 - Public GET endpoints expose only normalized fields selected by the service.
 - Run behind TLS and a reverse proxy in production.
 - Store `.env` values in a secret manager for deployed environments.
@@ -304,6 +411,6 @@ The pre-commit configuration runs Ruff, Ruff format, and mypy.
 - RBAC for privileged operations.
 - Rate limiting and abuse protection.
 - OpenAPI schema generation.
-- Pagination and sorting for large result sets.
-- Response caching for slow OpenStack API calls.
+- Additional inventory-backed routes for subnets, ports, volumes, floating IPs,
+  and security groups.
 - Metrics and tracing integration.

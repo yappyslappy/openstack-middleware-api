@@ -22,6 +22,17 @@ class Settings:
     flask_env: str = "production"
     flask_debug: bool = False
     api_key: str | None = None
+    inventory_scope: str | None = None
+    inventory_max_age_seconds: int = 900
+    mysql_host: str | None = None
+    mysql_port: int = 3306
+    mysql_database: str | None = None
+    mysql_username: str | None = None
+    mysql_password: str | None = None
+    mysql_charset: str = "utf8mb4"
+    mysql_pool_size: int = 5
+    mysql_max_overflow: int = 10
+    mysql_pool_recycle: int = 1800
     os_auth_type: str | None = DEFAULT_OPENSTACK_AUTH_TYPE
     os_auth_url: str | None = None
     os_application_credential_id: str | None = None
@@ -46,6 +57,17 @@ class Settings:
             flask_env=_env("FLASK_ENV", "production") or "production",
             flask_debug=_env_bool("FLASK_DEBUG"),
             api_key=_env("API_KEY"),
+            inventory_scope=_env("INVENTORY_SCOPE"),
+            inventory_max_age_seconds=_env_int("INVENTORY_MAX_AGE_SECONDS", 900),
+            mysql_host=_env("MYSQL_HOST"),
+            mysql_port=_env_int("MYSQL_PORT", 3306),
+            mysql_database=_env("MYSQL_DATABASE"),
+            mysql_username=_env("MYSQL_USERNAME"),
+            mysql_password=_env("MYSQL_PASSWORD"),
+            mysql_charset=_env("MYSQL_CHARSET", "utf8mb4") or "utf8mb4",
+            mysql_pool_size=_env_int("MYSQL_POOL_SIZE", 5),
+            mysql_max_overflow=_env_int("MYSQL_MAX_OVERFLOW", 10),
+            mysql_pool_recycle=_env_int("MYSQL_POOL_RECYCLE", 1800),
             os_auth_type=_env("OS_AUTH_TYPE", DEFAULT_OPENSTACK_AUTH_TYPE),
             os_auth_url=_env("OS_AUTH_URL"),
             os_application_credential_id=_env("OS_APPLICATION_CREDENTIAL_ID"),
@@ -77,6 +99,34 @@ class Settings:
                 f"Supported values: {supported}."
             )
         return auth_type
+
+    def validate_inventory(self) -> None:
+        """Raise ConfigurationError when inventory database config is invalid."""
+        required_values = {
+            "INVENTORY_SCOPE": self.inventory_scope,
+            "MYSQL_HOST": self.mysql_host,
+            "MYSQL_DATABASE": self.mysql_database,
+            "MYSQL_USERNAME": self.mysql_username,
+            "MYSQL_PASSWORD": self.mysql_password,
+            "MYSQL_CHARSET": self.mysql_charset,
+        }
+        missing = [name for name, value in required_values.items() if not value]
+        if missing:
+            joined = ", ".join(sorted(missing))
+            raise ConfigurationError(
+                f"Missing required inventory database settings: {joined}"
+            )
+
+        if not 1 <= self.mysql_port <= 65535:
+            raise ConfigurationError("MYSQL_PORT must be between 1 and 65535.")
+        if self.mysql_pool_size < 1:
+            raise ConfigurationError("MYSQL_POOL_SIZE must be at least 1.")
+        if self.mysql_max_overflow < 0:
+            raise ConfigurationError("MYSQL_MAX_OVERFLOW must be 0 or greater.")
+        if self.mysql_pool_recycle < 1:
+            raise ConfigurationError("MYSQL_POOL_RECYCLE must be at least 1.")
+        if self.inventory_max_age_seconds < 0:
+            raise ConfigurationError("INVENTORY_MAX_AGE_SECONDS must be 0 or greater.")
 
     def validate_openstack(self) -> None:
         """Raise ConfigurationError when OpenStack configuration is invalid."""
@@ -123,3 +173,13 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.lower() in {"1", "true", "t", "yes", "y", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = _env(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as error:
+        raise ConfigurationError(f"{name} must be an integer.") from error
