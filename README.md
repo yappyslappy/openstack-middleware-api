@@ -287,8 +287,7 @@ Or:
 python run.py
 ```
 
-Local Swagger UI is available at `http://127.0.0.1:5000/docs` when
-`OPENAPI_ENABLED=true`.
+Local Swagger UI is available at `/docs` when `OPENAPI_ENABLED=true`.
 
 For a production process manager, use Gunicorn:
 
@@ -473,6 +472,45 @@ GET /api/v1/servers?tag=<tag-a>&tag=<tag-b>
 
 The schema intentionally omits `page` and `per_page`; collection endpoints
 return all matching active rows and report only `meta.count`.
+
+### Swagger Troubleshooting
+
+If `/docs` returns HTML but the browser is blank, test the local Swagger assets
+directly:
+
+```bash
+curl -i "${API_BASE_URL}/docs"
+curl -i "${API_BASE_URL}/docs/assets/swagger-ui.css"
+curl -i "${API_BASE_URL}/docs/assets/swagger-ui-bundle.js"
+curl -i "${API_BASE_URL}/docs/assets/swagger-ui-standalone-preset.js"
+curl -i "${API_BASE_URL}/openapi.json"
+```
+
+Expected results:
+
+```text
+/docs                                      200 text/html
+/docs/assets/swagger-ui.css                200 text/css
+/docs/assets/swagger-ui-bundle.js          200 application/javascript or text/javascript
+/docs/assets/swagger-ui-standalone-preset.js 200 application/javascript or text/javascript
+/openapi.json                              200 application/json
+```
+
+Common causes:
+
+- `SwaggerUIBundle is not defined`: `/docs/assets/swagger-ui-bundle.js` is
+  missing, returning 404, or being served with the wrong MIME type.
+- `/docs/assets/* returns 404`: confirm `swagger-ui-bundle` is installed as a
+  runtime dependency and that the production image was rebuilt after dependency
+  changes.
+- Incorrect JavaScript MIME type: confirm the reverse proxy is not rewriting
+  static asset responses and that Flask is serving the packaged `.js` files.
+- Blank page behind a proxy: confirm the docs HTML references paths under the
+  same public prefix as `/docs` and `/openapi.json`.
+
+Swagger UI assets are served from the packaged `swagger-ui-bundle` dependency.
+The app does not download Swagger assets from a CDN at runtime, so restricted
+internal networks do not need Internet access for the documentation page.
 
 ## Example Curl Commands
 

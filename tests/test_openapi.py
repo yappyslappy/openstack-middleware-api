@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,15 @@ from app.config import ConfigurationError, Settings
 from app.openapi import SECURITY_SCHEME_NAME, build_openapi_spec
 from tests.helpers import inventory_settings
 
+SWAGGER_ASSETS = {
+    "/docs/assets/swagger-ui.css": {"text/css"},
+    "/docs/assets/swagger-ui-bundle.js": {"application/javascript", "text/javascript"},
+    "/docs/assets/swagger-ui-standalone-preset.js": {
+        "application/javascript",
+        "text/javascript",
+    },
+}
+
 
 def test_swagger_ui_and_spec_are_served_when_enabled() -> None:
     app = create_app(inventory_settings())
@@ -19,12 +29,98 @@ def test_swagger_ui_and_spec_are_served_when_enabled() -> None:
     spec_response = client.get("/openapi.json")
 
     assert docs_response.status_code == 200
+    assert docs_response.mimetype == "text/html"
     assert "SwaggerUIBundle" in docs_response.get_data(as_text=True)
     assert spec_response.status_code == 200
+    assert spec_response.mimetype == "application/json"
     payload = spec_response.get_json()
     assert payload["openapi"].startswith("3.")
     assert "/api/v1/servers" in payload["paths"]
     assert "/api/v1/servers/{server_id}" in payload["paths"]
+
+
+def test_swagger_html_references_valid_local_application_urls() -> None:
+    app = create_app(inventory_settings())
+    html = app.test_client().get("/docs").get_data(as_text=True)
+
+    assert 'href="/docs/assets/swagger-ui.css"' in html
+    assert 'src="/docs/assets/swagger-ui-bundle.js"' in html
+    assert 'src="/docs/assets/swagger-ui-standalone-preset.js"' in html
+    assert 'url: "/openapi.json"' in html
+    assert "http://" not in html
+    assert "https://" not in html
+    assert "cdn" not in html.lower()
+
+
+@pytest.mark.parametrize(("path", "expected_mimetypes"), SWAGGER_ASSETS.items())
+def test_swagger_assets_are_served_with_expected_mime_types(
+    path: str,
+    expected_mimetypes: set[str],
+) -> None:
+    app = create_app(inventory_settings())
+
+    response = app.test_client().get(path)
+
+    assert response.status_code == 200
+    assert response.mimetype in expected_mimetypes
+    assert response.get_data()
+
+
+def test_openapi_json_returns_valid_json() -> None:
+    app = create_app(inventory_settings())
+
+    response = app.test_client().get("/openapi.json")
+
+    assert response.status_code == 200
+    assert response.mimetype == "application/json"
+    assert response.get_json()["openapi"] == "3.0.3"
+
+
+def test_swagger_remains_functional_with_custom_openapi_paths() -> None:
+    app = create_app(
+        inventory_settings(
+            openapi_docs_path="/internal/docs",
+            openapi_spec_path="/internal/openapi.json",
+        )
+    )
+    client = app.test_client()
+
+    docs_response = client.get("/internal/docs")
+    html = docs_response.get_data(as_text=True)
+
+    assert docs_response.status_code == 200
+    assert 'href="/internal/docs/assets/swagger-ui.css"' in html
+    assert 'src="/internal/docs/assets/swagger-ui-bundle.js"' in html
+    assert 'src="/internal/docs/assets/swagger-ui-standalone-preset.js"' in html
+    assert 'url: "/internal/openapi.json"' in html
+    assert client.get("/internal/docs/assets/swagger-ui.css").status_code == 200
+    assert client.get("/internal/docs/assets/swagger-ui-bundle.js").status_code == 200
+    assert (
+        client.get("/internal/docs/assets/swagger-ui-standalone-preset.js").status_code
+        == 200
+    )
+    assert client.get("/internal/openapi.json").status_code == 200
+
+
+def test_swagger_urls_respect_trusted_proxy_prefix() -> None:
+    app = create_app(
+        inventory_settings(
+            trust_proxy_headers=True,
+            proxy_fix_x_prefix=1,
+        )
+    )
+
+    response = app.test_client().get(
+        "/docs",
+        headers={"X-Forwarded-Prefix": "/proxy-prefix"},
+    )
+    html = response.get_data(as_text=True)
+
+    assert response.status_code == 200
+    assert 'href="/proxy-prefix/docs/assets/swagger-ui.css"' in html
+    assert 'src="/proxy-prefix/docs/assets/swagger-ui-bundle.js"' in html
+    assert 'src="/proxy-prefix/docs/assets/swagger-ui-standalone-preset.js"' in html
+    assert 'url: "/proxy-prefix/openapi.json"' in html
 
 
 def test_swagger_ui_and_spec_are_404_when_disabled() -> None:
@@ -32,7 +128,40 @@ def test_swagger_ui_and_spec_are_404_when_disabled() -> None:
     client = app.test_client()
 
     assert client.get("/docs").status_code == 404
+    assert client.get("/docs/assets/swagger-ui.css").status_code == 404
+    assert client.get("/docs/assets/swagger-ui-bundle.js").status_code == 404
+    assert client.get("/docs/assets/swagger-ui-standalone-preset.js").status_code == 404
     assert client.get("/openapi.json").status_code == 404
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/docs/assets/../openapi.py",
+        "/docs/assets/%2e%2e/openapi.py",
+        "/docs/assets/../../pyproject.toml",
+    ],
+)
+def test_swagger_asset_route_rejects_path_traversal(path: str) -> None:
+    app = create_app(inventory_settings())
+
+    response = app.test_client().get(path)
+
+    assert response.status_code == 404
+
+
+def test_swagger_ui_bundle_is_a_runtime_dependency() -> None:
+    pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    runtime_dependencies = pyproject["project"]["dependencies"]
+    dev_dependencies = pyproject["project"]["optional-dependencies"]["dev"]
+
+    assert any(
+        dependency.startswith("swagger-ui-bundle")
+        for dependency in runtime_dependencies
+    )
+    assert not any(
+        dependency.startswith("swagger-ui-bundle") for dependency in dev_dependencies
+    )
 
 
 def test_openapi_spec_documents_bearer_key_but_keeps_get_routes_public() -> None:

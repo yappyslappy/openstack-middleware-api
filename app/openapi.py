@@ -8,7 +8,14 @@ from typing import Any, cast
 
 from apispec import APISpec
 from apispec.ext.marshmallow import MarshmallowPlugin
-from flask import Flask, abort, jsonify, render_template_string, send_from_directory
+from flask import (
+    Flask,
+    abort,
+    jsonify,
+    render_template_string,
+    send_from_directory,
+    url_for,
+)
 
 from app.config import Settings
 from app.schemas.common import ErrorResponseSchema
@@ -33,16 +40,16 @@ SWAGGER_TEMPLATE = """<!doctype html>
   <head>
     <meta charset="utf-8">
     <title>{{ title }}</title>
-    <link rel="stylesheet" href="{{ asset_base }}/swagger-ui.css">
+    <link rel="stylesheet" href="{{ css_url }}">
   </head>
   <body>
     <div id="swagger-ui"></div>
-    <script src="{{ asset_base }}/swagger-ui-bundle.js"></script>
-    <script src="{{ asset_base }}/swagger-ui-standalone-preset.js"></script>
+    <script src="{{ bundle_url }}"></script>
+    <script src="{{ preset_url }}"></script>
     <script>
       window.onload = function() {
         window.ui = SwaggerUIBundle({
-          url: "{{ spec_path }}",
+          url: "{{ spec_url }}",
           dom_id: "#swagger-ui",
           deepLinking: true,
           presets: [
@@ -67,7 +74,6 @@ def register_openapi(app: Flask) -> None:
     docs_path = settings.openapi_docs_path
     spec_path = settings.openapi_spec_path
     asset_path = f"{docs_path}/assets/<path:filename>"
-    asset_base = f"{docs_path}/assets"
 
     def openapi_json() -> Any:
         return jsonify(build_openapi_spec().to_dict())
@@ -76,8 +82,13 @@ def register_openapi(app: Flask) -> None:
         return render_template_string(
             SWAGGER_TEMPLATE,
             title=OPENAPI_TITLE,
-            spec_path=spec_path,
-            asset_base=asset_base,
+            spec_url=url_for("openapi_json"),
+            css_url=url_for("swagger_ui_asset", filename="swagger-ui.css"),
+            bundle_url=url_for("swagger_ui_asset", filename="swagger-ui-bundle.js"),
+            preset_url=url_for(
+                "swagger_ui_asset",
+                filename="swagger-ui-standalone-preset.js",
+            ),
         )
 
     def docs_asset(filename: str) -> Any:
@@ -355,10 +366,14 @@ def _package_version() -> str:
 
 def _swagger_ui_path() -> str | None:
     try:
-        from swagger_ui_bundle import swagger_ui_3_path
+        import swagger_ui_bundle
     except ImportError:
         return None
-    return str(swagger_ui_3_path)
+    for attribute in ("swagger_ui_path", "swagger_ui_3_path"):
+        swagger_path = getattr(swagger_ui_bundle, attribute, None)
+        if swagger_path is not None:
+            return str(swagger_path)
+    return None
 
 
 if __name__ == "__main__":
