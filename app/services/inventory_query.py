@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from math import ceil
 from typing import Any, cast
 
 from flask import Flask
@@ -13,18 +13,21 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings
 from app.database.session import get_inventory_session_factory
-from app.errors.handlers import BadRequest, NotFound, ServiceUnavailable
+from app.errors.handlers import BadRequest, Conflict, NotFound, ServiceUnavailable
 from app.repositories.inventory import (
+    CollectionResult,
     InventoryRepository,
+    InventoryResourceAmbiguous,
     InventoryResourceNotFound,
-    InventorySource,
-    InventorySourceNotFound,
-    PageResult,
-    Pagination,
 )
 
-MAX_PER_PAGE = 500
-DEFAULT_PER_PAGE = 100
+SOURCE_FILTER_LIMITS = {
+    "scope": 128,
+    "project_id": 128,
+    "project_name": 255,
+    "region": 255,
+}
+STRICT_SOURCE_FILTER = re.compile(r"^[A-Za-z0-9_.:-]+$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,14 +39,6 @@ class InventoryResponse:
 
 
 @dataclass(frozen=True, slots=True)
-class RequestPagination:
-    """Validated request pagination."""
-
-    repository: Pagination
-    include_meta: bool
-
-
-@dataclass(frozen=True, slots=True)
 class SortOptions:
     """Validated sort options."""
 
@@ -52,7 +47,7 @@ class SortOptions:
 
 
 class InventoryQueryService:
-    """API-facing read service backed by the inventory database."""
+    """API-facing read service backed by the global inventory database."""
 
     def __init__(
         self,
@@ -61,55 +56,52 @@ class InventoryQueryService:
         logger: logging.Logger | None = None,
     ) -> None:
         settings.validate_inventory()
-        self._inventory_scope = cast(str, settings.inventory_scope)
         self._max_age_seconds = settings.inventory_max_age_seconds
         self._session_factory = session_factory
         self._logger = logger or logging.getLogger(__name__)
 
     def health(self) -> InventoryResponse:
-        """Return application, database, and inventory sync health."""
+        """Return application, database, and global inventory sync health."""
 
         def query(repository: InventoryRepository) -> InventoryResponse:
             repository.check_database()
-            source = repository.get_active_source()
-            freshness = self._freshness(source)
-            return InventoryResponse(
-                {
-                    "application": "healthy",
-                    "database": "healthy",
-                    "inventory_scope": source.scope_key,
-                    "last_successful_sync_at": _datetime_string(
-                        source.last_successful_sync_at
-                    ),
-                    "inventory_age_seconds": freshness["inventory_age_seconds"],
-                    "inventory_stale": freshness["inventory_stale"],
-                }
-            )
+            sources = repository.list_inventory_sources().items
+            if not sources:
+                raise ServiceUnavailable("No active inventory sources are available.")
+            return InventoryResponse(self._health_payload(sources))
 
         return self._run("health", query)
 
+    def list_inventory_sources(self, args: Mapping[str, str]) -> InventoryResponse:
+        """Return safe active source metadata."""
+        source_filters = _source_filters(args)
+
+        def query(repository: InventoryRepository) -> InventoryResponse:
+            result = repository.list_inventory_sources(source_filters)
+            data = [_normalize_inventory_source(row) for row in result.items]
+            return InventoryResponse(data, _count_meta(result))
+
+        return self._run("list_inventory_sources", query)
+
     def list_projects(self, args: Mapping[str, str]) -> InventoryResponse:
-        """Return scoped active projects."""
-        pagination = _pagination(args)
+        """Return active projects across all active inventory sources."""
+        source_filters = _source_filters(args)
         sort = _sort(args, allowed={"id", "name"}, default="name")
 
         def query(repository: InventoryRepository) -> InventoryResponse:
-            source = repository.get_active_source()
-            page = repository.list_projects(
-                source, pagination.repository, sort.field, sort.descending
+            result = repository.list_projects(
+                source_filters, sort.field, sort.descending
             )
-            return InventoryResponse(
-                [_normalize_project(row) for row in page.items],
-                self._collection_meta(page) if pagination.include_meta else None,
-            )
+            data = [_normalize_project(row) for row in result.items]
+            return InventoryResponse(data, _count_meta(result))
 
         return self._run("list_projects", query)
 
     def list_servers(
         self, args: Mapping[str, str], tags: Sequence[str]
     ) -> InventoryResponse:
-        """Return scoped active servers, optionally filtered by tags."""
-        pagination = _pagination(args)
+        """Return active servers across all active inventory sources."""
+        source_filters = _source_filters(args)
         sort = _sort(
             args,
             allowed={
@@ -124,31 +116,27 @@ class InventoryQueryService:
             },
             default="name",
         )
-        filters = _server_filters(args)
+        resource_filters = _server_filters(args)
 
         def query(repository: InventoryRepository) -> InventoryResponse:
-            source = repository.get_active_source()
-            page = repository.list_servers(
-                source,
-                pagination.repository,
-                filters,
+            result = repository.list_servers(
+                source_filters,
+                resource_filters,
                 tags,
                 sort.field,
                 sort.descending,
             )
-            return InventoryResponse(
-                [_normalize_server(row) for row in page.items],
-                self._collection_meta(page) if pagination.include_meta else None,
-            )
+            data = [_normalize_server(row) for row in result.items]
+            return InventoryResponse(data, _count_meta(result))
 
         return self._run("list_servers", query)
 
-    def get_server(self, server_id: str) -> InventoryResponse:
-        """Return a single scoped active server."""
+    def get_server(self, server_id: str, args: Mapping[str, str]) -> InventoryResponse:
+        """Return one active server, requiring disambiguation when needed."""
+        source_filters = _source_filters(args)
 
         def query(repository: InventoryRepository) -> InventoryResponse:
-            source = repository.get_active_source()
-            server = repository.get_server(source, server_id)
+            server = repository.get_server(server_id, source_filters)
             return InventoryResponse(_normalize_server(server))
 
         return self._run(
@@ -158,53 +146,42 @@ class InventoryQueryService:
         )
 
     def list_networks(self, args: Mapping[str, str]) -> InventoryResponse:
-        """Return scoped active networks."""
-        pagination = _pagination(args)
+        """Return active networks across all active inventory sources."""
+        source_filters = _source_filters(args)
         sort = _sort(args, allowed={"id", "name", "status"}, default="name")
 
         def query(repository: InventoryRepository) -> InventoryResponse:
-            source = repository.get_active_source()
-            page = repository.list_networks(
-                source, pagination.repository, sort.field, sort.descending
+            result = repository.list_networks(
+                source_filters, sort.field, sort.descending
             )
-            return InventoryResponse(
-                [_normalize_network(row) for row in page.items],
-                self._collection_meta(page) if pagination.include_meta else None,
-            )
+            data = [_normalize_network(row) for row in result.items]
+            return InventoryResponse(data, _count_meta(result))
 
         return self._run("list_networks", query)
 
     def list_images(self, args: Mapping[str, str]) -> InventoryResponse:
-        """Return scoped active images."""
-        pagination = _pagination(args)
+        """Return active images across all active inventory sources."""
+        source_filters = _source_filters(args)
         sort = _sort(args, allowed={"id", "name", "status"}, default="name")
 
         def query(repository: InventoryRepository) -> InventoryResponse:
-            source = repository.get_active_source()
-            page = repository.list_images(
-                source, pagination.repository, sort.field, sort.descending
-            )
-            return InventoryResponse(
-                [_normalize_image(row) for row in page.items],
-                self._collection_meta(page) if pagination.include_meta else None,
-            )
+            result = repository.list_images(source_filters, sort.field, sort.descending)
+            data = [_normalize_image(row) for row in result.items]
+            return InventoryResponse(data, _count_meta(result))
 
         return self._run("list_images", query)
 
     def list_flavors(self, args: Mapping[str, str]) -> InventoryResponse:
-        """Return scoped active flavors."""
-        pagination = _pagination(args)
+        """Return active flavors across all active inventory sources."""
+        source_filters = _source_filters(args)
         sort = _sort(args, allowed={"id", "name"}, default="name")
 
         def query(repository: InventoryRepository) -> InventoryResponse:
-            source = repository.get_active_source()
-            page = repository.list_flavors(
-                source, pagination.repository, sort.field, sort.descending
+            result = repository.list_flavors(
+                source_filters, sort.field, sort.descending
             )
-            return InventoryResponse(
-                [_normalize_flavor(row) for row in page.items],
-                self._collection_meta(page) if pagination.include_meta else None,
-            )
+            data = [_normalize_flavor(row) for row in result.items]
+            return InventoryResponse(data, _count_meta(result))
 
         return self._run("list_flavors", query)
 
@@ -217,11 +194,12 @@ class InventoryQueryService:
     ) -> InventoryResponse:
         try:
             with self._session_factory() as session:
-                repository = InventoryRepository(session, self._inventory_scope)
+                repository = InventoryRepository(session)
                 return query(repository)
-        except InventorySourceNotFound as error:
-            raise ServiceUnavailable(
-                "Configured inventory scope is unavailable."
+        except InventoryResourceAmbiguous as error:
+            raise Conflict(
+                "Server ID matches multiple inventory sources; add a scope query "
+                "parameter."
             ) from error
         except InventoryResourceNotFound as error:
             raise NotFound(not_found_message) from error
@@ -232,34 +210,43 @@ class InventoryQueryService:
             )
             raise ServiceUnavailable("Inventory database is unavailable.") from error
 
-    def _collection_meta(self, page: PageResult) -> dict[str, Any]:
-        freshness = self._freshness(page.source)
+    def _health_payload(self, sources: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        stale_scopes: list[str] = []
+        failed_scopes: list[str] = []
+        successful_syncs: list[datetime] = []
+
+        for source in sources:
+            scope = _string(source["scope_key"])
+            last_success = _utc_datetime(source["last_successful_sync_at"])
+            last_failure = _utc_datetime(source["last_failed_sync_at"])
+            if last_success is None:
+                stale_scopes.append(scope)
+            else:
+                successful_syncs.append(last_success)
+                age_seconds = int((now - last_success).total_seconds())
+                if age_seconds > self._max_age_seconds:
+                    stale_scopes.append(scope)
+
+            if last_failure is not None and (
+                last_success is None or last_failure >= last_success
+            ):
+                failed_scopes.append(scope)
+
         return {
-            "page": page.page,
-            "per_page": page.per_page,
-            "total": page.total,
-            "pages": ceil(page.total / page.per_page) if page.total else 0,
-            "inventory_scope": page.source.scope_key,
-            "last_successful_sync_at": _datetime_string(
-                page.source.last_successful_sync_at
+            "application": "healthy",
+            "database": "healthy",
+            "active_inventory_sources": len(sources),
+            "stale_inventory_sources": len(stale_scopes),
+            "stale_inventory_scopes": stale_scopes,
+            "failed_inventory_sources": len(failed_scopes),
+            "failed_inventory_scopes": failed_scopes,
+            "oldest_successful_sync_at": (
+                _datetime_string(min(successful_syncs)) if successful_syncs else None
             ),
-            "inventory_age_seconds": freshness["inventory_age_seconds"],
-            "inventory_stale": freshness["inventory_stale"],
-        }
-
-    def _freshness(self, source: InventorySource) -> dict[str, int | bool | None]:
-        last_success = source.last_successful_sync_at
-        if last_success is None:
-            return {"inventory_age_seconds": None, "inventory_stale": True}
-
-        if last_success.tzinfo is None:
-            last_success = last_success.replace(tzinfo=UTC)
-        age_seconds = max(
-            0, int((datetime.now(UTC) - last_success.astimezone(UTC)).total_seconds())
-        )
-        return {
-            "inventory_age_seconds": age_seconds,
-            "inventory_stale": age_seconds > self._max_age_seconds,
+            "newest_successful_sync_at": (
+                _datetime_string(max(successful_syncs)) if successful_syncs else None
+            ),
         }
 
 
@@ -273,23 +260,30 @@ def create_inventory_query_service(app: Flask) -> InventoryQueryService:
     )
 
 
-def _pagination(args: Mapping[str, str]) -> RequestPagination:
-    page_supplied = "page" in args or "per_page" in args
-    page = _positive_int(args.get("page", "1"), "page")
-    per_page = _positive_int(args.get("per_page", str(DEFAULT_PER_PAGE)), "per_page")
-    if per_page > MAX_PER_PAGE:
-        raise BadRequest(f"per_page must be {MAX_PER_PAGE} or fewer.")
-    return RequestPagination(Pagination(page=page, per_page=per_page), page_supplied)
+def _source_filters(args: Mapping[str, str]) -> dict[str, str]:
+    filters: dict[str, str] = {}
+    for key, max_length in SOURCE_FILTER_LIMITS.items():
+        raw_value = args.get(key)
+        if raw_value is None:
+            continue
+        value = _validated_query_value(key, raw_value, max_length)
+        if key in {"scope", "project_id", "region"} and not STRICT_SOURCE_FILTER.match(
+            value
+        ):
+            raise BadRequest(f"{key} filter contains unsupported characters.")
+        filters[key] = value
+    return filters
 
 
-def _positive_int(value: str | None, name: str) -> int:
-    try:
-        parsed = int(value or "")
-    except ValueError as error:
-        raise BadRequest(f"{name} must be a positive integer.") from error
-    if parsed < 1:
-        raise BadRequest(f"{name} must be a positive integer.")
-    return parsed
+def _validated_query_value(name: str, value: str, max_length: int) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise BadRequest(f"{name} filter must be non-empty.")
+    if len(normalized) > max_length:
+        raise BadRequest(f"{name} filter must be {max_length} characters or fewer.")
+    if any(_is_control_character(character) for character in normalized):
+        raise BadRequest(f"{name} filter must not contain control characters.")
+    return normalized
 
 
 def _sort(args: Mapping[str, str], *, allowed: set[str], default: str) -> SortOptions:
@@ -317,11 +311,24 @@ def _server_filters(args: Mapping[str, str]) -> dict[str, str]:
         raw_value = args.get(key)
         if raw_value is None:
             continue
-        value = raw_value.strip()
-        if not value:
-            raise BadRequest(f"{key} filter must be non-empty.")
-        filters[key] = value
+        filters[key] = _validated_query_value(key, raw_value, 255)
     return filters
+
+
+def _count_meta(result: CollectionResult) -> dict[str, Any]:
+    return {"count": result.total}
+
+
+def _normalize_inventory_source(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": _optional_int(row["id"]),
+        "scope": _string(row["scope_key"]),
+        "openstack_project_id": _optional_string(row["openstack_project_id"]),
+        "openstack_project_name": _optional_string(row["openstack_project_name"]),
+        "region_name": _optional_string(row["region_name"]),
+        "last_successful_sync_at": _datetime_string(row["last_successful_sync_at"]),
+        "last_failed_sync_at": _datetime_string(row["last_failed_sync_at"]),
+    }
 
 
 def _normalize_project(row: Mapping[str, Any]) -> dict[str, Any]:
@@ -331,6 +338,7 @@ def _normalize_project(row: Mapping[str, Any]) -> dict[str, Any]:
         "description": _optional_string(row["description"]),
         "enabled": _optional_bool(row["is_enabled"]),
         "domain_id": _optional_string(row["domain_id"]),
+        "inventory_source": _source_identity(row),
     }
 
 
@@ -346,6 +354,7 @@ def _normalize_server(row: Mapping[str, Any]) -> dict[str, Any]:
         "tags": _string_list(row["tags"]),
         "created_at": _datetime_string(row["resource_created_at"]),
         "updated_at": _datetime_string(row["resource_updated_at"]),
+        "inventory_source": _source_identity(row),
     }
 
 
@@ -364,6 +373,7 @@ def _normalize_network(row: Mapping[str, Any]) -> dict[str, Any]:
         "provider_segmentation_id": _optional_int(row["provider_segmentation_id"]),
         "created_at": _datetime_string(row["resource_created_at"]),
         "updated_at": _datetime_string(row["resource_updated_at"]),
+        "inventory_source": _source_identity(row),
     }
 
 
@@ -381,6 +391,7 @@ def _normalize_image(row: Mapping[str, Any]) -> dict[str, Any]:
         "checksum": _optional_string(row["checksum"]),
         "created_at": _datetime_string(row["resource_created_at"]),
         "updated_at": _datetime_string(row["resource_updated_at"]),
+        "inventory_source": _source_identity(row),
     }
 
 
@@ -396,6 +407,17 @@ def _normalize_flavor(row: Mapping[str, Any]) -> dict[str, Any]:
         "is_public": _optional_bool(row["is_public"]),
         "created_at": _datetime_string(row["resource_created_at"]),
         "updated_at": _datetime_string(row["resource_updated_at"]),
+        "inventory_source": _source_identity(row),
+    }
+
+
+def _source_identity(row: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "id": _optional_int(row["source_id"]),
+        "scope": _string(row["source_scope"]),
+        "project_id": _optional_string(row["source_openstack_project_id"]),
+        "project_name": _optional_string(row["source_openstack_project_name"]),
+        "region_name": _optional_string(row["source_region_name"]),
     }
 
 
@@ -452,11 +474,23 @@ def _string_list(value: Any) -> list[str]:
 
 
 def _datetime_string(value: Any) -> str | None:
+    timestamp = _utc_datetime(value)
+    if timestamp is None:
+        return None
+    return timestamp.isoformat().replace("+00:00", "Z")
+
+
+def _utc_datetime(value: Any) -> datetime | None:
     if value is None:
         return None
-    if isinstance(value, datetime):
-        timestamp = value
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=UTC)
-        return timestamp.astimezone(UTC).isoformat().replace("+00:00", "Z")
-    return str(value)
+    if not isinstance(value, datetime):
+        return None
+    timestamp = value
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    return timestamp.astimezone(UTC)
+
+
+def _is_control_character(character: str) -> bool:
+    codepoint = ord(character)
+    return codepoint < 32 or codepoint == 127

@@ -14,6 +14,9 @@ class RecordingRouteService:
     def __init__(self) -> None:
         self.last_tags: list[str] | None = None
 
+    def list_inventory_sources(self, args: Any) -> SimpleNamespace:
+        return SimpleNamespace(data=[], meta={"count": 0})
+
     def list_projects(self, args: Any) -> SimpleNamespace:
         return SimpleNamespace(data=[], meta=None)
 
@@ -24,7 +27,7 @@ class RecordingRouteService:
             meta=None,
         )
 
-    def get_server(self, server_id: str) -> SimpleNamespace:
+    def get_server(self, server_id: str, args: Any) -> SimpleNamespace:
         return SimpleNamespace(data={"id": server_id}, meta=None)
 
     def list_networks(self, args: Any) -> SimpleNamespace:
@@ -94,7 +97,6 @@ def _inventory_settings() -> Settings:
     return Settings(
         api_key="test-key",
         testing=True,
-        inventory_scope="appdev",
         mysql_host="127.0.0.1",
         mysql_database="openstack_inventory",
         mysql_username="openstack_api",
