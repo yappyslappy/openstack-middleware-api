@@ -11,11 +11,11 @@ from app.config import Settings
 from app.services.inventory_query import InventoryQueryService
 
 
-def inventory_settings(scope: str = "appdev", **overrides: Any) -> Settings:
+def inventory_settings(**overrides: Any) -> Settings:
     values: dict[str, Any] = {
         "api_key": "test-key",
         "testing": True,
-        "inventory_scope": scope,
+        "inventory_scope": None,
         "mysql_host": "127.0.0.1",
         "mysql_database": "openstack_inventory",
         "mysql_username": "openstack_api",
@@ -25,8 +25,8 @@ def inventory_settings(scope: str = "appdev", **overrides: Any) -> Settings:
     return Settings(**values)
 
 
-def make_inventory_app(engine: Engine, scope: str = "appdev") -> Flask:
-    settings = inventory_settings(scope)
+def make_inventory_app(engine: Engine, legacy_scope: str | None = None) -> Flask:
+    settings = inventory_settings(inventory_scope=legacy_scope)
     app = create_app(settings)
     session_factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
     app.extensions["inventory_query_service"] = InventoryQueryService(

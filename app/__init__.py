@@ -15,6 +15,8 @@ def create_app(settings: Settings | None = None) -> Flask:
     app = Flask(__name__, instance_relative_config=True)
     app_settings = settings or Settings.from_env()
     app_settings.validate_inventory()
+    if app_settings.inventory_scope:
+        app.logger.warning("inventory_scope_deprecated_ignored")
 
     app.config.update(
         ENV=app_settings.flask_env,

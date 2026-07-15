@@ -100,6 +100,12 @@ class FakeConnection:
 
 
 class FakeInventoryRouteService:
+    def list_inventory_sources(self, args: Any) -> SimpleNamespace:
+        return SimpleNamespace(
+            data=[{"id": 1, "scope": "appdev"}],
+            meta={"count": 1},
+        )
+
     def list_projects(self, args: Any) -> SimpleNamespace:
         return SimpleNamespace(data=[{"id": "project-1", "name": "demo"}], meta=None)
 
@@ -109,7 +115,7 @@ class FakeInventoryRouteService:
             meta=None,
         )
 
-    def get_server(self, server_id: str) -> SimpleNamespace:
+    def get_server(self, server_id: str, args: Any) -> SimpleNamespace:
         if server_id != "server-1":
             raise NotFound("Inventory server was not found.")
         return SimpleNamespace(data={"id": "server-1", "name": "web01"}, meta=None)
@@ -172,6 +178,11 @@ def test_api_routes_use_standard_success_envelope() -> None:
         "status": "success",
         "data": {"id": "server-1", "name": "web01"},
     }
+    assert client.get("/api/v1/inventory-sources").get_json() == {
+        "status": "success",
+        "data": [{"id": 1, "scope": "appdev"}],
+        "meta": {"count": 1},
+    }
     assert client.get("/api/v1/networks").get_json()["data"][0]["id"] == "network-1"
     assert client.get("/api/v1/images").get_json()["data"][0]["id"] == "image-1"
     assert client.get("/api/v1/flavors").get_json()["data"][0]["id"] == "flavor-1"
@@ -196,7 +207,6 @@ def _inventory_settings() -> Settings:
     return Settings(
         api_key="test-key",
         testing=True,
-        inventory_scope="appdev",
         mysql_host="127.0.0.1",
         mysql_database="openstack_inventory",
         mysql_username="openstack_api",

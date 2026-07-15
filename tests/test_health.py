@@ -13,5 +13,5 @@ def test_health_endpoint_is_public(inventory_app: Flask) -> None:
     data = response.get_json()["data"]
     assert data["application"] == "healthy"
     assert data["database"] == "healthy"
-    assert data["inventory_scope"] == "appdev"
-    assert data["inventory_stale"] is False
+    assert data["active_inventory_sources"] == 2
+    assert data["stale_inventory_sources"] == 0

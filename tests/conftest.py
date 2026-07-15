@@ -35,8 +35,8 @@ def inventory_app(inventory_engine: Engine) -> Flask:
 
 @pytest.fixture
 def inventory_app_factory(inventory_engine: Engine) -> Callable[[str], Flask]:
-    def factory(scope: str = "appdev") -> Flask:
-        return make_inventory_app(inventory_engine, scope)
+    def factory(legacy_scope: str = "appdev") -> Flask:
+        return make_inventory_app(inventory_engine, legacy_scope)
 
     return factory
 
@@ -61,8 +61,19 @@ def _seed_inventory(engine: Engine) -> None:
                 _project(1, "project-1", "demo", created_at, updated_at),
                 _project(1, "project-deleted", "deleted", created_at, updated_at, True),
                 _project(2, "project-1", "apptest", created_at, updated_at),
+                _project(3, "project-1", "inactive", created_at, updated_at),
             ],
         )
+        bulk_servers = [
+            _server(
+                1,
+                f"bulk-{number:03d}",
+                f"bulk-{number:03d}",
+                created_at,
+                updated_at,
+            )
+            for number in range(1, 183)
+        ]
         connection.execute(
             models.servers.insert(),
             [
@@ -75,6 +86,7 @@ def _seed_inventory(engine: Engine) -> None:
                     addresses={"fallback": [{"addr": "10.0.0.99"}]},
                 ),
                 _server(1, "server-2", "api01", created_at, updated_at),
+                *bulk_servers,
                 _server(
                     1,
                     "server-deleted",
@@ -84,6 +96,7 @@ def _seed_inventory(engine: Engine) -> None:
                     deleted=True,
                 ),
                 _server(2, "server-1", "apptest-web", created_at, updated_at),
+                _server(3, "inactive-server", "inactive01", created_at, updated_at),
             ],
         )
         connection.execute(
@@ -100,7 +113,18 @@ def _seed_inventory(engine: Engine) -> None:
                     "server_id": "server-2",
                     "tag": "production",
                 },
+                {
+                    "inventory_source_id": 2,
+                    "server_id": "server-1",
+                    "tag": "production",
+                },
+                {"inventory_source_id": 2, "server_id": "server-1", "tag": "web"},
                 {"inventory_source_id": 2, "server_id": "server-1", "tag": "apptest"},
+                {
+                    "inventory_source_id": 3,
+                    "server_id": "inactive-server",
+                    "tag": "production",
+                },
             ],
         )
         connection.execute(
@@ -109,6 +133,7 @@ def _seed_inventory(engine: Engine) -> None:
                 _address(1, "server-1", "private", "10.0.0.5"),
                 _address(1, "server-1", "public", "203.0.113.10", "floating"),
                 _address(2, "server-1", "private", "10.1.0.5"),
+                _address(3, "inactive-server", "private", "10.2.0.5"),
             ],
         )
         connection.execute(
@@ -117,6 +142,7 @@ def _seed_inventory(engine: Engine) -> None:
                 _network(1, "network-1", "private", created_at, updated_at),
                 _network(1, "network-deleted", "old-net", created_at, updated_at, True),
                 _network(2, "network-1", "apptest-net", created_at, updated_at),
+                _network(3, "network-1", "inactive-net", created_at, updated_at),
             ],
         )
         connection.execute(
@@ -125,6 +151,7 @@ def _seed_inventory(engine: Engine) -> None:
                 _image(1, "image-1", "Ubuntu 24.04", created_at, updated_at),
                 _image(1, "image-deleted", "old-image", created_at, updated_at, True),
                 _image(2, "image-1", "AppTest Image", created_at, updated_at),
+                _image(3, "image-1", "Inactive Image", created_at, updated_at),
             ],
         )
         connection.execute(
@@ -135,6 +162,7 @@ def _seed_inventory(engine: Engine) -> None:
                     1, "flavor-deleted", "old-flavor", created_at, updated_at, True
                 ),
                 _flavor(2, "flavor-1", "apptest.small", created_at, updated_at),
+                _flavor(3, "flavor-1", "inactive.small", created_at, updated_at),
             ],
         )
 
@@ -149,7 +177,7 @@ def _source(
         "id": source_id,
         "scope_key": scope,
         "openstack_project_id": f"{scope}-project",
-        "openstack_project_name": scope,
+        "openstack_project_name": f"DF-{scope.upper()}",
         "region_name": "RegionOne",
         "auth_url": "https://openstack.example/v3",
         "is_active": active,
@@ -194,7 +222,7 @@ def _server(
         name,
         created_at,
         updated_at,
-        project_id="project-1",
+        project_id=_project_id_for_source(source_id),
         status="ACTIVE",
         user_id="user-1",
         flavor_id="flavor-1",
@@ -242,7 +270,7 @@ def _network(
         name,
         created_at,
         updated_at,
-        project_id="project-1",
+        project_id=_project_id_for_source(source_id),
         status="ACTIVE",
         mtu=1500,
         admin_state_up=True,
@@ -332,3 +360,12 @@ def _resource(
     }
     data.update(extra)
     return data
+
+
+def _project_id_for_source(source_id: int) -> str:
+    project_ids = {
+        1: "appdev-project",
+        2: "apptest-project",
+        3: "inactive-project",
+    }
+    return project_ids[source_id]

@@ -37,6 +37,13 @@ class Forbidden(ApiError):
     message = "Forbidden."
 
 
+class Conflict(ApiError):
+    """Conflict error."""
+
+    status_code = 409
+    message = "Conflict."
+
+
 class NotFound(ApiError):
     """Not found error."""
 
@@ -103,5 +110,6 @@ def _http_message(code: int) -> str:
         400: "Bad request.",
         404: "Resource not found.",
         405: "Method not allowed.",
+        409: "Conflict.",
     }
     return messages.get(code, "Request failed.")

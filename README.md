@@ -2,16 +2,22 @@
 
 A production-ready Flask middleware API for exposing selected OpenStack
 infrastructure data through public, normalized REST endpoints. Public read
-endpoints query the MySQL inventory database populated by the separate
-`openstack-inventory-sync` project. The OpenStack SDK client is retained for
-future authenticated mutating endpoints.
+endpoints query one shared MySQL inventory database populated by the separate
+`openstack-inventory-sync` project for multiple OpenStack projects. One API
+service returns global inventory across all active inventory sources by default.
+The OpenStack SDK client is retained for future authenticated mutating
+endpoints.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    OpenStackProjects[OpenStack projects] --> Sync[openstack-inventory-sync]
-    Sync --> MySQL[(MySQL inventory)]
+    AppDev[OpenStack AppDev] --> SyncAppDev[appdev sync]
+    AppTest[OpenStack AppTest] --> SyncAppTest[apptest sync]
+    Other[Other projects] --> SyncOther[project sync]
+    SyncAppDev --> MySQL[(Shared MySQL inventory)]
+    SyncAppTest --> MySQL
+    SyncOther --> MySQL
     Client[Public API client] --> Flask[Flask app factory]
     Flask --> Auth[Method-based auth middleware]
     Flask --> Routes[GET Blueprint routes]
@@ -31,8 +37,8 @@ flowchart LR
   resources.
 - `app/database/` owns SQLAlchemy engine/session setup and read-only table
   descriptions for the sync-owned inventory schema.
-- `app/repositories/inventory.py` owns source-scoped SQL queries, pagination,
-  filtering, and tag/address loading.
+- `app/repositories/inventory.py` owns active-source SQL queries, source
+  filtering, and tag/address loading without implicit pagination.
 - `app/services/inventory_query.py` validates request filters and normalizes
   database rows into safe public JSON payloads.
 - `app/services/openstack_client.py` keeps lazy `openstacksdk` support for
@@ -113,7 +119,6 @@ Required inventory and API settings:
 
 ```text
 API_KEY=
-INVENTORY_SCOPE=appdev
 INVENTORY_MAX_AGE_SECONDS=900
 MYSQL_HOST=127.0.0.1
 MYSQL_PORT=3306
@@ -126,10 +131,10 @@ MYSQL_MAX_OVERFLOW=10
 MYSQL_POOL_RECYCLE=1800
 ```
 
-`INVENTORY_SCOPE` is deployment-level isolation. An AppDev deployment should use
-`INVENTORY_SCOPE=appdev`; an AppTest deployment should use
-`INVENTORY_SCOPE=apptest`. API clients cannot select a scope with a request
-parameter.
+`INVENTORY_SCOPE` is deprecated and ignored by the global API. If it remains in
+an old environment file, it will not restrict results to AppDev, AppTest, or any
+other single source. Use optional query parameters such as `?scope=appdev` when
+a client wants to filter results.
 
 GET endpoints do not require working OpenStack credentials at application
 startup and do not query OpenStack. OpenStack configuration is retained for
@@ -201,10 +206,11 @@ API defines read-only SQLAlchemy table descriptions for SELECT queries only. Do
 not run Alembic migrations for inventory tables from this project, and do not
 call `Base.metadata.create_all()` or any schema-creation behavior in the API.
 
-Every resource query resolves the configured active source with
-`inventory_sources.scope_key = INVENTORY_SCOPE` and includes
+Every resource query joins to active rows in `inventory_sources` and includes
 `resource.inventory_source_id = inventory_sources.id`. Active resource rows are
-filtered with `is_deleted = false`.
+filtered with `is_deleted = false`. Resource responses include safe source
+identity so callers can distinguish AppDev, AppTest, and other inventory
+sources.
 
 Use a dedicated read-only MySQL identity for the API:
 
@@ -235,8 +241,22 @@ python run.py
 For a production process manager, use Gunicorn:
 
 ```bash
-gunicorn "run:app" --bind 0.0.0.0:5000 --workers 4
+gunicorn "run:app" --bind 0.0.0.0:8000 --workers 4
 ```
+
+Production should run one global API service, for example
+`openstack-middleware-api.service`, on one backend port per API server. A common
+topology is:
+
+```text
+HAProxy VIP
+    |
+    +-- df2v-osapi-01.ebsi.corp:8000
+    +-- df2v-osapi-02.ebsi.corp:8000
+```
+
+Do not run separate API services or ports for AppDev, AppTest, or other
+OpenStack projects.
 
 ## REST API
 
@@ -263,52 +283,78 @@ Available public GET endpoints:
 
 ```text
 GET /health
+GET /api/v1/inventory-sources
 GET /api/v1/projects
 GET /api/v1/servers
 GET /api/v1/servers?tag=production
 GET /api/v1/servers?tag=production&tag=web
+GET /api/v1/servers?scope=appdev
 GET /api/v1/servers/<server_id>
+GET /api/v1/servers/<server_id>?scope=appdev
 GET /api/v1/networks
 GET /api/v1/images
 GET /api/v1/flavors
 ```
 
-`GET /health` returns application and database health, the configured inventory
-scope, the last successful sync timestamp, inventory age in seconds, and an
-`inventory_stale` flag. Unreachable MySQL or an unknown/inactive
-`INVENTORY_SCOPE` returns HTTP 503 with a sanitized error response. Stale
-inventory returns HTTP 200 with `inventory_stale=true` so short sync delays do
-not unnecessarily remove the API from load balancers.
+Collection endpoints return all matching active rows from all active inventory
+sources by default. There is no default pagination, no implicit 100-row limit,
+and no pagination metadata. Collection responses include `meta.count`.
 
-Collection endpoints support pagination:
+Resource responses include source identity:
 
-```text
-?page=1&per_page=100
+```json
+{
+  "id": "server-uuid",
+  "name": "DF2V-WEBCOR-Q02",
+  "inventory_source": {
+    "id": 3,
+    "scope": "appdev",
+    "project_id": "279964236c2e4d15b9a1bae1952f9e9d",
+    "project_name": "DF-APPDEV",
+    "region_name": "RegionOne"
+  }
+}
 ```
 
-`page` defaults to `1`, `per_page` defaults to `100`, and `per_page` is capped
-at `500`. To preserve existing clients, the default response remains
-`status` plus `data`; when `page` or `per_page` is supplied, responses also
-include `meta` with pagination and inventory freshness fields.
+Optional source filters are supported:
+
+```text
+?scope=appdev
+?project_id=<OpenStack project UUID>
+?project_name=DF-APPDEV
+?region=RegionOne
+```
+
+`GET /api/v1/servers/<server_id>` searches all active sources. If the server ID
+exists in more than one active source, the API returns HTTP 409 and the caller
+should add a source filter such as `?scope=appdev`.
+
+`GET /health` returns application and database health plus global inventory
+source counts, stale source counts, failed source counts, and oldest/newest
+successful sync timestamps. Unreachable MySQL or zero active inventory sources
+returns HTTP 503 with a sanitized error response. Stale inventory sources return
+HTTP 200 with visible stale scope information so one delayed project sync does
+not unnecessarily remove the whole API from load balancers.
 
 ## Example Curl Commands
 
 ```bash
-curl http://localhost:5000/health
-curl http://localhost:5000/api/v1/projects
-curl http://localhost:5000/api/v1/servers
-curl http://localhost:5000/api/v1/servers?tag=production
-curl http://localhost:5000/api/v1/servers?tag=production&tag=web
-curl http://localhost:5000/api/v1/servers/server-id
-curl http://localhost:5000/api/v1/networks
-curl http://localhost:5000/api/v1/images
-curl http://localhost:5000/api/v1/flavors
+curl http://api.ebsi.corp/health
+curl http://api.ebsi.corp/api/v1/inventory-sources
+curl http://api.ebsi.corp/api/v1/projects
+curl http://api.ebsi.corp/api/v1/servers
+curl "http://api.ebsi.corp/api/v1/servers?scope=appdev"
+curl "http://api.ebsi.corp/api/v1/servers?tag=preview&tag=windows-exporter"
+curl "http://api.ebsi.corp/api/v1/servers/server-id?scope=appdev"
+curl http://api.ebsi.corp/api/v1/networks
+curl http://api.ebsi.corp/api/v1/images
+curl http://api.ebsi.corp/api/v1/flavors
 ```
 
 Mutating methods are protected globally:
 
 ```bash
-curl -X POST http://localhost:5000/api/v1/example \
+curl -X POST http://api.ebsi.corp/api/v1/example \
   -H "Authorization: Bearer ${API_KEY}"
 ```
 
@@ -341,6 +387,12 @@ GET /api/v1/servers?tag=production&tag=web
 Multiple tags use AND matching, so a server must contain every requested tag to
 be returned. The order of tag parameters does not affect matching. Duplicate
 tags are ignored while preserving the first occurrence.
+
+Tag filters combine with source filters:
+
+```text
+GET /api/v1/servers?scope=appdev&tag=preview&tag=windows-exporter
+```
 
 The API validates that tags are non-empty after trimming whitespace, at most 128
 characters, and free of control characters. Invalid or empty tags return HTTP
@@ -375,18 +427,30 @@ does not require a real MySQL server.
 ## Production Upgrade
 
 1. Deploy and verify `openstack-inventory-sync` first so MySQL has current
-   `inventory_sources` and resource rows for the target scope.
+   `inventory_sources` and resource rows for every target project.
 2. Create a dedicated API MySQL user with `SELECT` only.
-3. Configure `INVENTORY_SCOPE` and MySQL environment variables for each API
-   deployment, such as `appdev` or `apptest`.
+3. Configure one API service with the shared MySQL environment variables.
 4. Deploy this API version and check `/health` for `database=healthy` and the
-   expected inventory scope.
-5. Confirm GET endpoints return inventory data without OpenStack API traffic.
+   expected active inventory source count.
+5. Confirm `/api/v1/servers` returns all active sources without OpenStack API
+   traffic and without requiring callers to page through results.
 
 Rollback is the previous API version plus its previous environment. Keep the
 sync service running during rollback unless the prior API version explicitly
 does not need inventory freshness. If MySQL is unavailable, this version returns
 503 for GET endpoints instead of falling back to OpenStack.
+
+## Future Write Operations
+
+The OpenStack client and auth modes remain available for future `POST`, `PUT`,
+`PATCH`, and `DELETE` endpoints, but this change does not add any mutating
+routes. A single OpenStack Application Credential is scoped to one project, so
+future multi-project writes will need a safe credential-selection design. A
+future write endpoint must identify the target inventory source/project and load
+the appropriate OpenStack credential securely. Database values such as
+`inventory_sources.auth_url` must never be treated as OpenStack credentials.
+Current GET startup does not depend on valid OpenStack credentials, and
+OpenStack initialization remains lazy.
 
 ## Security Considerations
 

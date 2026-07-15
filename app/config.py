@@ -103,7 +103,6 @@ class Settings:
     def validate_inventory(self) -> None:
         """Raise ConfigurationError when inventory database config is invalid."""
         required_values = {
-            "INVENTORY_SCOPE": self.inventory_scope,
             "MYSQL_HOST": self.mysql_host,
             "MYSQL_DATABASE": self.mysql_database,
             "MYSQL_USERNAME": self.mysql_username,

@@ -5,99 +5,87 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import and_, func, select, text
+from sqlalchemy import and_, func, select, text, tuple_
 from sqlalchemy.orm import Session
 
 from app.database import models
 
 
-class InventorySourceNotFound(Exception):
-    """Raised when the configured active inventory source does not exist."""
-
-
 class InventoryResourceNotFound(Exception):
-    """Raised when a scoped resource does not exist."""
+    """Raised when a requested resource does not exist."""
+
+
+class InventoryResourceAmbiguous(Exception):
+    """Raised when a requested resource ID exists in multiple active sources."""
 
 
 @dataclass(frozen=True, slots=True)
 class InventorySource:
-    """Active inventory source selected by deployment scope."""
+    """Safe active inventory source metadata."""
 
     id: int
-    scope_key: str
+    scope: str
+    openstack_project_id: str | None
+    openstack_project_name: str | None
+    region_name: str | None
     last_successful_sync_at: datetime | None
     last_failed_sync_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
-class Pagination:
-    """Repository pagination options."""
-
-    page: int
-    per_page: int
-
-
-@dataclass(frozen=True, slots=True)
-class PageResult:
-    """A page of inventory rows plus count/source metadata."""
+class CollectionResult:
+    """Unpaginated inventory rows plus total count."""
 
     items: list[dict[str, Any]]
     total: int
-    page: int
-    per_page: int
-    source: InventorySource
 
 
 class InventoryRepository:
     """SQLAlchemy Core queries for sync-owned inventory tables."""
 
-    def __init__(self, session: Session, inventory_scope: str) -> None:
+    def __init__(self, session: Session) -> None:
         self._session = session
-        self._inventory_scope = inventory_scope
 
     def check_database(self) -> None:
         """Run a lightweight database connectivity check."""
         self._session.execute(text("SELECT 1")).scalar_one()
 
-    def get_active_source(self) -> InventorySource:
-        """Return the active inventory source for the configured scope."""
+    def list_inventory_sources(
+        self, source_filters: Mapping[str, str] | None = None
+    ) -> CollectionResult:
+        """Return safe metadata for all active inventory sources."""
         source = models.inventory_sources
-        row = (
-            self._session.execute(
-                select(
-                    source.c.id,
-                    source.c.scope_key,
-                    source.c.last_successful_sync_at,
-                    source.c.last_failed_sync_at,
-                ).where(
-                    source.c.scope_key == self._inventory_scope,
-                    source.c.is_active.is_(True),
-                )
+        statement = (
+            select(
+                source.c.id,
+                source.c.scope_key,
+                source.c.openstack_project_id,
+                source.c.openstack_project_name,
+                source.c.region_name,
+                source.c.last_successful_sync_at,
+                source.c.last_failed_sync_at,
             )
-            .mappings()
-            .one_or_none()
+            .where(
+                source.c.is_active.is_(True),
+                *_source_filter_conditions(source, source_filters or {}),
+            )
+            .order_by(source.c.scope_key, source.c.id)
         )
-        if row is None:
-            raise InventorySourceNotFound
-        return InventorySource(
-            id=int(row["id"]),
-            scope_key=str(row["scope_key"]),
-            last_successful_sync_at=row["last_successful_sync_at"],
-            last_failed_sync_at=row["last_failed_sync_at"],
-        )
+        rows = [dict(row) for row in self._session.execute(statement).mappings().all()]
+        return CollectionResult(items=rows, total=len(rows))
 
     def list_projects(
         self,
-        source: InventorySource,
-        pagination: Pagination,
+        source_filters: Mapping[str, str],
         sort_field: str,
         sort_descending: bool,
-    ) -> PageResult:
+    ) -> CollectionResult:
         table = models.projects
         return self._list_resource(
             table=table,
-            source=source,
+            source_filters=source_filters,
             columns=[
+                table.c.inventory_source_id,
                 table.c.id,
                 table.c.name,
                 table.c.description,
@@ -106,7 +94,6 @@ class InventoryRepository:
                 table.c.resource_created_at,
                 table.c.resource_updated_at,
             ],
-            pagination=pagination,
             sort_field=sort_field,
             sort_descending=sort_descending,
             sort_columns={"id": table.c.id, "name": table.c.name},
@@ -114,13 +101,13 @@ class InventoryRepository:
 
     def list_servers(
         self,
-        source: InventorySource,
-        pagination: Pagination,
-        filters: Mapping[str, str],
+        source_filters: Mapping[str, str],
+        resource_filters: Mapping[str, str],
         tags: Sequence[str],
         sort_field: str,
         sort_descending: bool,
-    ) -> PageResult:
+    ) -> CollectionResult:
+        source = models.inventory_sources
         table = models.servers
         columns = [
             table.c.inventory_source_id,
@@ -133,30 +120,39 @@ class InventoryRepository:
             table.c.addresses,
             table.c.resource_created_at,
             table.c.resource_updated_at,
+            *_source_columns(source),
         ]
-        statement = select(*columns).where(
-            table.c.inventory_source_id == source.id,
+        statement = select(*columns).select_from(
+            table.join(source, source.c.id == table.c.inventory_source_id)
+        )
+        statement = statement.where(
+            source.c.is_active.is_(True),
             table.c.is_deleted.is_(False),
+            *_source_filter_conditions(source, source_filters),
         )
 
-        for filter_name, filter_value in filters.items():
+        for filter_name, filter_value in resource_filters.items():
             statement = statement.where(getattr(table.c, filter_name) == filter_value)
 
         if tags:
             tag_table = models.server_tags
             matching_servers = (
                 select(table.c.inventory_source_id, table.c.id)
-                .join(
-                    tag_table,
-                    and_(
-                        tag_table.c.inventory_source_id == table.c.inventory_source_id,
-                        tag_table.c.server_id == table.c.id,
-                    ),
+                .select_from(
+                    table.join(source, source.c.id == table.c.inventory_source_id).join(
+                        tag_table,
+                        and_(
+                            tag_table.c.inventory_source_id
+                            == table.c.inventory_source_id,
+                            tag_table.c.server_id == table.c.id,
+                        ),
+                    )
                 )
                 .where(
-                    table.c.inventory_source_id == source.id,
+                    source.c.is_active.is_(True),
                     table.c.is_deleted.is_(False),
                     tag_table.c.tag.in_(list(tags)),
+                    *_source_filter_conditions(source, source_filters),
                 )
                 .group_by(table.c.inventory_source_id, table.c.id)
                 .having(func.count(func.distinct(tag_table.c.tag)) == len(tags))
@@ -185,19 +181,20 @@ class InventoryRepository:
         if sort_descending:
             sort_column = sort_column.desc()
 
-        statement = statement.order_by(sort_column, table.c.id)
-        rows, total = self._paginate(statement, pagination)
-        return PageResult(
-            items=self._hydrate_servers(source.id, rows),
-            total=total,
-            page=pagination.page,
-            per_page=pagination.per_page,
-            source=source,
-        )
+        statement = statement.order_by(source.c.scope_key, sort_column, table.c.id)
+        rows = [dict(row) for row in self._session.execute(statement).mappings().all()]
+        items = self._hydrate_servers(rows)
+        return CollectionResult(items=items, total=len(items))
 
-    def get_server(self, source: InventorySource, server_id: str) -> dict[str, Any]:
+    def get_server(
+        self,
+        server_id: str,
+        source_filters: Mapping[str, str],
+    ) -> dict[str, Any]:
+        """Return one active server, or raise on missing/ambiguous matches."""
+        source = models.inventory_sources
         table = models.servers
-        row = (
+        rows = (
             self._session.execute(
                 select(
                     table.c.inventory_source_id,
@@ -210,31 +207,40 @@ class InventoryRepository:
                     table.c.addresses,
                     table.c.resource_created_at,
                     table.c.resource_updated_at,
-                ).where(
-                    table.c.inventory_source_id == source.id,
+                    *_source_columns(source),
+                )
+                .select_from(
+                    table.join(source, source.c.id == table.c.inventory_source_id)
+                )
+                .where(
+                    source.c.is_active.is_(True),
                     table.c.id == server_id,
                     table.c.is_deleted.is_(False),
+                    *_source_filter_conditions(source, source_filters),
                 )
+                .order_by(source.c.scope_key, table.c.id)
             )
             .mappings()
-            .one_or_none()
+            .all()
         )
-        if row is None:
+        if not rows:
             raise InventoryResourceNotFound
-        return self._hydrate_servers(source.id, [dict(row)])[0]
+        if len(rows) > 1:
+            raise InventoryResourceAmbiguous
+        return self._hydrate_servers([dict(rows[0])])[0]
 
     def list_networks(
         self,
-        source: InventorySource,
-        pagination: Pagination,
+        source_filters: Mapping[str, str],
         sort_field: str,
         sort_descending: bool,
-    ) -> PageResult:
+    ) -> CollectionResult:
         table = models.networks
         return self._list_resource(
             table=table,
-            source=source,
+            source_filters=source_filters,
             columns=[
+                table.c.inventory_source_id,
                 table.c.id,
                 table.c.name,
                 table.c.project_id,
@@ -249,7 +255,6 @@ class InventoryRepository:
                 table.c.resource_created_at,
                 table.c.resource_updated_at,
             ],
-            pagination=pagination,
             sort_field=sort_field,
             sort_descending=sort_descending,
             sort_columns={
@@ -261,16 +266,16 @@ class InventoryRepository:
 
     def list_images(
         self,
-        source: InventorySource,
-        pagination: Pagination,
+        source_filters: Mapping[str, str],
         sort_field: str,
         sort_descending: bool,
-    ) -> PageResult:
+    ) -> CollectionResult:
         table = models.images
         return self._list_resource(
             table=table,
-            source=source,
+            source_filters=source_filters,
             columns=[
+                table.c.inventory_source_id,
                 table.c.id,
                 table.c.name,
                 table.c.status,
@@ -284,7 +289,6 @@ class InventoryRepository:
                 table.c.resource_created_at,
                 table.c.resource_updated_at,
             ],
-            pagination=pagination,
             sort_field=sort_field,
             sort_descending=sort_descending,
             sort_columns={
@@ -296,16 +300,16 @@ class InventoryRepository:
 
     def list_flavors(
         self,
-        source: InventorySource,
-        pagination: Pagination,
+        source_filters: Mapping[str, str],
         sort_field: str,
         sort_descending: bool,
-    ) -> PageResult:
+    ) -> CollectionResult:
         table = models.flavors
         return self._list_resource(
             table=table,
-            source=source,
+            source_filters=source_filters,
             columns=[
+                table.c.inventory_source_id,
                 table.c.id,
                 table.c.name,
                 table.c.vcpus,
@@ -317,7 +321,6 @@ class InventoryRepository:
                 table.c.resource_created_at,
                 table.c.resource_updated_at,
             ],
-            pagination=pagination,
             sort_field=sort_field,
             sort_descending=sort_descending,
             sort_columns={"id": table.c.id, "name": table.c.name},
@@ -327,77 +330,84 @@ class InventoryRepository:
         self,
         *,
         table: Any,
-        source: InventorySource,
+        source_filters: Mapping[str, str],
         columns: Sequence[Any],
-        pagination: Pagination,
         sort_field: str,
         sort_descending: bool,
         sort_columns: Mapping[str, Any],
-    ) -> PageResult:
-        sort_column = sort_columns[sort_field]
+    ) -> CollectionResult:
+        source = models.inventory_sources
+        sort_column: Any = sort_columns[sort_field]
         if sort_descending:
             sort_column = sort_column.desc()
 
         statement = (
-            select(*columns)
+            select(*columns, *_source_columns(source))
+            .select_from(table.join(source, source.c.id == table.c.inventory_source_id))
             .where(
-                table.c.inventory_source_id == source.id,
+                source.c.is_active.is_(True),
                 table.c.is_deleted.is_(False),
+                *_source_filter_conditions(source, source_filters),
             )
-            .order_by(sort_column, table.c.id)
+            .order_by(source.c.scope_key, sort_column, table.c.id)
         )
-        rows, total = self._paginate(statement, pagination)
-        return PageResult(
-            items=rows,
-            total=total,
-            page=pagination.page,
-            per_page=pagination.per_page,
-            source=source,
-        )
+        rows = [dict(row) for row in self._session.execute(statement).mappings().all()]
+        return CollectionResult(items=rows, total=len(rows))
 
     def _hydrate_servers(
-        self, source_id: int, server_rows: list[dict[str, Any]]
+        self, server_rows: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         if not server_rows:
             return []
 
-        server_ids = [str(row["id"]) for row in server_rows]
-        tags_by_server = self._tags_by_server(source_id, server_ids)
-        addresses_by_server = self._addresses_by_server(source_id, server_ids)
+        server_keys = _server_keys(server_rows)
+        tags_by_server = self._tags_by_server(server_keys)
+        addresses_by_server = self._addresses_by_server(server_keys)
         for row in server_rows:
-            server_id = str(row["id"])
-            row["tags"] = tags_by_server.get(server_id, [])
-            row["normalized_addresses"] = addresses_by_server.get(server_id, {})
+            key = (int(row["inventory_source_id"]), str(row["id"]))
+            row["tags"] = tags_by_server.get(key, [])
+            row["normalized_addresses"] = addresses_by_server.get(key, {})
         return server_rows
 
     def _tags_by_server(
-        self, source_id: int, server_ids: Sequence[str]
-    ) -> dict[str, list[str]]:
+        self, server_keys: Sequence[tuple[int, str]]
+    ) -> dict[tuple[int, str], list[str]]:
         tag_table = models.server_tags
         rows = (
             self._session.execute(
-                select(tag_table.c.server_id, tag_table.c.tag)
-                .where(
-                    tag_table.c.inventory_source_id == source_id,
-                    tag_table.c.server_id.in_(list(server_ids)),
+                select(
+                    tag_table.c.inventory_source_id,
+                    tag_table.c.server_id,
+                    tag_table.c.tag,
                 )
-                .order_by(tag_table.c.server_id, tag_table.c.tag)
+                .where(
+                    tuple_(tag_table.c.inventory_source_id, tag_table.c.server_id).in_(
+                        list(server_keys)
+                    )
+                )
+                .order_by(
+                    tag_table.c.inventory_source_id,
+                    tag_table.c.server_id,
+                    tag_table.c.tag,
+                )
             )
             .mappings()
             .all()
         )
-        grouped: dict[str, list[str]] = {server_id: [] for server_id in server_ids}
+        grouped: dict[tuple[int, str], list[str]] = {key: [] for key in server_keys}
         for row in rows:
-            grouped[str(row["server_id"])].append(str(row["tag"]))
+            key = (int(row["inventory_source_id"]), str(row["server_id"]))
+            grouped[key].append(str(row["tag"]))
         return grouped
 
     def _addresses_by_server(
-        self, source_id: int, server_ids: Sequence[str]
-    ) -> dict[str, dict[str, list[dict[str, Any]]]]:
+        self, server_keys: Sequence[tuple[int, str]]
+    ) -> dict[tuple[int, str], dict[str, list[dict[str, Any]]]]:
         address_table = models.server_addresses
         rows = (
             self._session.execute(
                 select(
+                    address_table.c.inventory_source_id,
                     address_table.c.server_id,
                     address_table.c.network_name,
                     address_table.c.address,
@@ -406,10 +416,13 @@ class InventoryRepository:
                     address_table.c.mac_address,
                 )
                 .where(
-                    address_table.c.inventory_source_id == source_id,
-                    address_table.c.server_id.in_(list(server_ids)),
+                    tuple_(
+                        address_table.c.inventory_source_id,
+                        address_table.c.server_id,
+                    ).in_(list(server_keys))
                 )
                 .order_by(
+                    address_table.c.inventory_source_id,
                     address_table.c.server_id,
                     address_table.c.network_name,
                     address_table.c.address,
@@ -418,31 +431,48 @@ class InventoryRepository:
             .mappings()
             .all()
         )
-        grouped: dict[str, dict[str, list[dict[str, Any]]]] = {}
+        grouped: dict[tuple[int, str], dict[str, list[dict[str, Any]]]] = {}
         for row in rows:
-            server_id = str(row["server_id"])
+            key = (int(row["inventory_source_id"]), str(row["server_id"]))
             network_name = str(row["network_name"])
-            grouped.setdefault(server_id, {}).setdefault(network_name, []).append(
+            grouped.setdefault(key, {}).setdefault(network_name, []).append(
                 _address_payload(dict(row))
             )
         return grouped
 
-    def _paginate(
-        self, statement: Any, pagination: Pagination
-    ) -> tuple[list[dict[str, Any]], int]:
-        total = self._session.scalar(
-            select(func.count()).select_from(statement.order_by(None).subquery())
-        )
-        rows = (
-            self._session.execute(
-                statement.limit(pagination.per_page).offset(
-                    (pagination.page - 1) * pagination.per_page
-                )
-            )
-            .mappings()
-            .all()
-        )
-        return [dict(row) for row in rows], int(total or 0)
+
+def _source_columns(source: Any) -> list[Any]:
+    return [
+        source.c.id.label("source_id"),
+        source.c.scope_key.label("source_scope"),
+        source.c.openstack_project_id.label("source_openstack_project_id"),
+        source.c.openstack_project_name.label("source_openstack_project_name"),
+        source.c.region_name.label("source_region_name"),
+        source.c.last_successful_sync_at.label("source_last_successful_sync_at"),
+        source.c.last_failed_sync_at.label("source_last_failed_sync_at"),
+    ]
+
+
+def _source_filter_conditions(source: Any, filters: Mapping[str, str]) -> list[Any]:
+    filter_columns = {
+        "scope": source.c.scope_key,
+        "project_id": source.c.openstack_project_id,
+        "project_name": source.c.openstack_project_name,
+        "region": source.c.region_name,
+    }
+    return [filter_columns[key] == value for key, value in filters.items()]
+
+
+def _server_keys(rows: Sequence[Mapping[str, Any]]) -> list[tuple[int, str]]:
+    keys: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for row in rows:
+        key = (int(row["inventory_source_id"]), str(row["id"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        keys.append(key)
+    return keys
 
 
 def _address_payload(row: Mapping[str, Any]) -> dict[str, Any]:

@@ -22,8 +22,16 @@ bp = Blueprint("openstack", __name__, url_prefix="/api/v1")
 
 @bp.get("/projects")
 def list_projects() -> ResponseReturnValue:
-    """Return inventory projects for the configured scope."""
+    """Return inventory projects from active sources."""
     return _inventory_success(_inventory_query_service().list_projects(request.args))
+
+
+@bp.get("/inventory-sources")
+def list_inventory_sources() -> ResponseReturnValue:
+    """Return active inventory source metadata."""
+    return _inventory_success(
+        _inventory_query_service().list_inventory_sources(request.args)
+    )
 
 
 @bp.get("/servers")
@@ -38,24 +46,26 @@ def list_servers() -> ResponseReturnValue:
 @bp.get("/servers/<server_id>")
 def get_server(server_id: str) -> ResponseReturnValue:
     """Return one inventory server by ID."""
-    return _inventory_success(_inventory_query_service().get_server(server_id))
+    return _inventory_success(
+        _inventory_query_service().get_server(server_id, request.args)
+    )
 
 
 @bp.get("/networks")
 def list_networks() -> ResponseReturnValue:
-    """Return inventory networks for the configured scope."""
+    """Return inventory networks from active sources."""
     return _inventory_success(_inventory_query_service().list_networks(request.args))
 
 
 @bp.get("/images")
 def list_images() -> ResponseReturnValue:
-    """Return inventory images for the configured scope."""
+    """Return inventory images from active sources."""
     return _inventory_success(_inventory_query_service().list_images(request.args))
 
 
 @bp.get("/flavors")
 def list_flavors() -> ResponseReturnValue:
-    """Return inventory flavors for the configured scope."""
+    """Return inventory flavors from active sources."""
     return _inventory_success(_inventory_query_service().list_flavors(request.args))
 
 
