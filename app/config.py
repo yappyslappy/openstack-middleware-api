@@ -9,6 +9,8 @@ DEFAULT_IDENTITY_API_VERSION = "3"
 DEFAULT_INTERFACE = "public"
 DEFAULT_OPENSTACK_AUTH_TYPE = "application_credential"
 SUPPORTED_OPENSTACK_AUTH_TYPES = frozenset({DEFAULT_OPENSTACK_AUTH_TYPE, "password"})
+OPENAPI_RESERVED_PATH_PREFIXES = ("/api/",)
+OPENAPI_RESERVED_PATHS = frozenset({"/api", "/health"})
 
 
 class ConfigurationError(ValueError):
@@ -33,6 +35,15 @@ class Settings:
     mysql_pool_size: int = 5
     mysql_max_overflow: int = 10
     mysql_pool_recycle: int = 1800
+    openapi_enabled: bool = True
+    openapi_docs_path: str = "/docs"
+    openapi_spec_path: str = "/openapi.json"
+    trust_proxy_headers: bool = False
+    proxy_fix_x_for: int = 1
+    proxy_fix_x_proto: int = 1
+    proxy_fix_x_host: int = 1
+    proxy_fix_x_port: int = 1
+    proxy_fix_x_prefix: int = 0
     os_auth_type: str | None = DEFAULT_OPENSTACK_AUTH_TYPE
     os_auth_url: str | None = None
     os_application_credential_id: str | None = None
@@ -68,6 +79,16 @@ class Settings:
             mysql_pool_size=_env_int("MYSQL_POOL_SIZE", 5),
             mysql_max_overflow=_env_int("MYSQL_MAX_OVERFLOW", 10),
             mysql_pool_recycle=_env_int("MYSQL_POOL_RECYCLE", 1800),
+            openapi_enabled=_env_bool("OPENAPI_ENABLED", True),
+            openapi_docs_path=_env("OPENAPI_DOCS_PATH", "/docs") or "/docs",
+            openapi_spec_path=_env("OPENAPI_SPEC_PATH", "/openapi.json")
+            or "/openapi.json",
+            trust_proxy_headers=_env_bool("TRUST_PROXY_HEADERS", False),
+            proxy_fix_x_for=_env_int("PROXY_FIX_X_FOR", 1),
+            proxy_fix_x_proto=_env_int("PROXY_FIX_X_PROTO", 1),
+            proxy_fix_x_host=_env_int("PROXY_FIX_X_HOST", 1),
+            proxy_fix_x_port=_env_int("PROXY_FIX_X_PORT", 1),
+            proxy_fix_x_prefix=_env_int("PROXY_FIX_X_PREFIX", 0),
             os_auth_type=_env("OS_AUTH_TYPE", DEFAULT_OPENSTACK_AUTH_TYPE),
             os_auth_url=_env("OS_AUTH_URL"),
             os_application_credential_id=_env("OS_APPLICATION_CREDENTIAL_ID"),
@@ -127,6 +148,36 @@ class Settings:
         if self.inventory_max_age_seconds < 0:
             raise ConfigurationError("INVENTORY_MAX_AGE_SECONDS must be 0 or greater.")
 
+    def validate_openapi(self) -> None:
+        """Raise ConfigurationError when OpenAPI configuration is invalid."""
+        for name, path in {
+            "OPENAPI_DOCS_PATH": self.openapi_docs_path,
+            "OPENAPI_SPEC_PATH": self.openapi_spec_path,
+        }.items():
+            if not path.startswith("/"):
+                raise ConfigurationError(f"{name} must start with '/'.")
+            if path != "/" and path.endswith("/"):
+                raise ConfigurationError(f"{name} must not end with '/'.")
+            if _openapi_path_conflicts(path):
+                raise ConfigurationError(f"{name} conflicts with an API route.")
+
+        if self.openapi_docs_path == self.openapi_spec_path:
+            raise ConfigurationError(
+                "OPENAPI_DOCS_PATH and OPENAPI_SPEC_PATH must be different."
+            )
+
+    def validate_proxy(self) -> None:
+        """Raise ConfigurationError when proxy-header configuration is invalid."""
+        for name, value in {
+            "PROXY_FIX_X_FOR": self.proxy_fix_x_for,
+            "PROXY_FIX_X_PROTO": self.proxy_fix_x_proto,
+            "PROXY_FIX_X_HOST": self.proxy_fix_x_host,
+            "PROXY_FIX_X_PORT": self.proxy_fix_x_port,
+            "PROXY_FIX_X_PREFIX": self.proxy_fix_x_prefix,
+        }.items():
+            if value < 0:
+                raise ConfigurationError(f"{name} must be 0 or greater.")
+
     def validate_openstack(self) -> None:
         """Raise ConfigurationError when OpenStack configuration is invalid."""
         auth_type = self.resolved_openstack_auth_type
@@ -155,8 +206,7 @@ class Settings:
         if missing:
             joined = ", ".join(sorted(missing))
             raise ConfigurationError(
-                f"Missing required OpenStack settings for "
-                f"{auth_type} auth: {joined}"
+                f"Missing required OpenStack settings for {auth_type} auth: {joined}"
             )
 
 
@@ -182,3 +232,9 @@ def _env_int(name: str, default: int) -> int:
         return int(value)
     except ValueError as error:
         raise ConfigurationError(f"{name} must be an integer.") from error
+
+
+def _openapi_path_conflicts(path: str) -> bool:
+    if path in OPENAPI_RESERVED_PATHS:
+        return True
+    return any(path.startswith(prefix) for prefix in OPENAPI_RESERVED_PATH_PREFIXES)

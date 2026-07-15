@@ -1,0 +1,9 @@
+services:
+  api:
+    env_file:
+      - .env.docker
+    ports:
+      - "8000:8000"
+    environment:
+      GUNICORN_WORKERS: "2"
+      GUNICORN_THREADS: "2"

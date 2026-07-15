@@ -11,12 +11,15 @@ requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [{ name = "OpenStack Middleware API Maintainers" }]
 dependencies = [
+  "apispec>=6.0.0,<7.0.0",
   "Flask>=3.0.0,<4.0.0",
   "gunicorn>=22.0.0,<24.0.0",
+  "marshmallow>=3.20.0,<4.0.0",
   "openstacksdk>=4.0.0,<5.0.0",
   "PyMySQL>=1.1.0,<2.0.0",
   "python-dotenv>=1.0.0,<2.0.0",
   "SQLAlchemy>=2.0.0,<3.0.0",
+  "swagger-ui-bundle>=1.1.0,<2.0.0",
 ]
 
 [project.optional-dependencies]
