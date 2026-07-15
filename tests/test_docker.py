@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 from runpy import run_path
 from typing import Any
@@ -17,6 +18,23 @@ def test_dockerfile_uses_hardened_gunicorn_runtime() -> None:
     assert "HEALTHCHECK" in dockerfile
     assert 'CMD ["gunicorn", "run:app", "-c", "docker/gunicorn.conf.py"]' in dockerfile
     assert ".env" not in dockerfile
+
+
+def test_docker_image_installs_runtime_swagger_asset_package() -> None:
+    dockerfile = _read("Dockerfile")
+    pyproject = tomllib.loads(_read("pyproject.toml"))
+    runtime_dependencies = pyproject["project"]["dependencies"]
+    dev_dependencies = pyproject["project"]["optional-dependencies"]["dev"]
+
+    assert "RUN pip install --no-cache-dir ." in dockerfile
+    assert '".[dev]"' not in dockerfile
+    assert any(
+        dependency.startswith("swagger-ui-bundle")
+        for dependency in runtime_dependencies
+    )
+    assert not any(
+        dependency.startswith("swagger-ui-bundle") for dependency in dev_dependencies
+    )
 
 
 def test_dockerignore_excludes_local_state_and_tests() -> None:
